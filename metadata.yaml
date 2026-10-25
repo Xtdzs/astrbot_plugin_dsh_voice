@@ -1,7 +1,7 @@
 name: astrbot_plugin_dsh_voice
 display_name: 语音说话（精简版）
-desc: 给现有 AstrBot 增加 MiniMax/千问说话能力，每条由模型自主选择文字或语音，成功发送语音后不重复发文字。
-version: 0.6.0
+desc: 让现有模型自主选择文字或语音，并按语境控制 MiniMax 情绪、语速、音量、音高和停顿；保持角色音色，语音成功后不重复发文字。
+version: 0.7.0
 author: Xtdzs
 repo: https://github.com/Xtdzs/astrbot_plugin_dsh_voice
 astrbot_version: '>=4.0.0'

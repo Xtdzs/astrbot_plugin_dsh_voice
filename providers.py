@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from .core import credential
+from .core import credential, voice_style
 from .errors import PluginError
 
 
@@ -86,10 +86,11 @@ class CloudAudio:
         else:
             self.minimax_key()
 
-    async def speech(self, text: str) -> Audio:
+    async def speech(self, text: str, *, style: dict | None = None) -> Audio:
         self.speech_preflight()
         cfg = self.config.get("speech", {})
         provider = cfg.get("provider", "minimax")
+        selected = voice_style(**style) if style is not None else None
         limit = min(
             int(cfg.get("max_characters", 500)), 600 if provider == "qwen" else 9999
         )
@@ -129,6 +130,14 @@ class CloudAudio:
                 raise PluginError("千问没有返回音频。")
         elif provider == "minimax":
             minimax = self.config.get("minimax", {})
+            voice = {
+                "voice_id": minimax.get("voice_id") or "lovely_girl",
+                "speed": selected["speed"] if selected else float(cfg.get("speed", 1)),
+            }
+            if selected:
+                voice.update(vol=selected["volume"], pitch=selected["pitch"])
+                if selected["emotion"] != "auto":
+                    voice["emotion"] = selected["emotion"]
             body = await self.json(
                 "POST",
                 str(minimax.get("base_url") or "https://api.minimax.cn").rstrip("/")
@@ -139,10 +148,7 @@ class CloudAudio:
                     "text": text,
                     "stream": False,
                     "output_format": "hex",
-                    "voice_setting": {
-                        "voice_id": minimax.get("voice_id") or "lovely_girl",
-                        "speed": float(cfg.get("speed", 1)),
-                    },
+                    "voice_setting": voice,
                     "audio_setting": {
                         "sample_rate": 32000,
                         "format": "wav",

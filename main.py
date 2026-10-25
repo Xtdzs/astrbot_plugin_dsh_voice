@@ -18,11 +18,14 @@ from .core import RequestGate, conversation_key, spoken_chunks
 from .errors import PluginError
 from .providers import CloudAudio
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 PREFIX = "voice_addon_"
 MEDIA_POLICY = """[语音外挂]
 每条回复的表达形式由你根据当前对话、用户意愿和原有角色性格自主选择，不需要用户切换模式。
 选择文字时直接正常回复，不调用音频工具。聊天适合开口、表达情绪、问候或口头解释时，你可以自主调用 voice_speak，把真正要说的正文放进 text；不要只是宣称自己正在说话。
+使用 MiniMax 时，你可以同时按语境选择 emotion、speed、volume、pitch。情绪默认 auto；语速一般 1.0，兴奋 1.1–1.2，安慰 0.85–0.95；音量 0.8–1.2，音高为 -2 至 2 的整数，平常为 0。保持原有角色，不要每句话都夸张表演。
+语音 text 可以在句间加入 <#0.3#> 等 0.1–0.6 秒停顿。MiniMax Speech 2.8 可少量使用 (chuckle)、(laughs)、(sighs)、(breath)，每次最多两处；不要用中文括号描述情绪。停顿、语气标签只放在工具 text 中，普通文字回复不带这些标签。
+一次调用选一种主要情绪；确需分句变化时依次调用，不并行发送多段声音，不编造情绪百分比。千问当前只提供基础朗读，保留默认表达参数，插件会去除不支持的控制标签。
 用户对本次发送形式有明确要求时优先遵从。仅在本轮实际提供对应工具时调用；没有可用工具就自然回复文字，不输出伪造的调用代码。
 语音工具发送成功后，本轮不要再发送文字正文、相同内容的转录或成功确认，直接结束即可。工具返回只是给你的执行结果，不要照读给用户。
 若语音发送失败且没有声音送出，就用文字自然回答；不要假装已经成功，也不要向用户展示 API 字段或技术过程。
@@ -32,7 +35,7 @@ HELP = """语音说话 · 精简版
 /说话 今天也要开心 —— 手动测试语音
 /voice 状态 —— 查看语音配置
 /voice 帮助 —— 查看说明
-配置面板只需填写 MiniMax 或千问语音 API 与音色。现有模型需启用工具调用，才能自主选择语音。"""
+配置面板填写 MiniMax 或千问 API 与音色；MiniMax 的情绪、语速、音量、音高和停顿由模型按语境选择。现有模型需启用工具调用。"""
 
 
 class VoiceAddonPlugin(Star):
@@ -160,26 +163,32 @@ class VoiceAddonPlugin(Star):
         detail = str(error) if isinstance(error, PluginError) else type(error).__name__
         logger.warning(f"[voice_addon] 音频调用未完成：{detail}")
 
-    async def make_records(self, event, text):
+    async def make_records(self, event, text, style=None):
         speech = self.config.get("speech", {})
         limit = min(
             int(speech.get("max_characters", 500)),
             600 if speech.get("provider", "minimax") == "qwen" else 9999,
         )
         chunks = spoken_chunks(
-            text, limit, int(speech.get("max_reply_characters", 2000))
+            text,
+            limit,
+            int(speech.get("max_reply_characters", 2000)),
+            expressive=speech.get("provider", "minimax") == "minimax",
+            interjections=str(
+                self.config.get("minimax", {}).get("speech_model") or "speech-2.8-turbo"
+            ).startswith("speech-2.8-"),
         )
         if not chunks:
             return []
         key = self.key(event)
-        self.gate.enter(key)
+        self.gate.enter(key, continuation=event.get_extra(PREFIX + "tool_audio", False))
         task = asyncio.current_task()
         self.tasks.add(task)
         try:
             self.cleanup()
             records = []
             for chunk in chunks:
-                audio = await self.cloud.speech(chunk)
+                audio = await self.cloud.speech(chunk, style=style)
                 path = self.media_dir / f"dsh-{uuid.uuid4().hex}.{audio.extension}"
                 try:
                     await self.cloud.download(audio, path)
@@ -237,7 +246,7 @@ class VoiceAddonPlugin(Star):
             logger.error(f"[voice_addon] 操作失败：{type(error).__name__}")
             await event.send(event.plain_result("这次没能发出来，请稍后再试。"))
 
-    async def perform(self, event, verb, argument):
+    async def perform(self, event, verb, argument, style=None):
         if self.closing:
             raise PluginError("插件正在关闭。")
         if not self.allowed(str(event.get_sender_id())):
@@ -245,7 +254,7 @@ class VoiceAddonPlugin(Star):
         if verb in ("说", "say"):
             if not argument:
                 raise PluginError("用法：/说话 要说的内容")
-            records = await self.make_records(event, argument)
+            records = await self.make_records(event, argument, style)
             if not records:
                 raise PluginError("这段内容没有可以朗读的文字。")
             for record in records:
@@ -256,15 +265,37 @@ class VoiceAddonPlugin(Star):
         raise PluginError("发送 /voice 帮助 查看说话和配置说明。")
 
     @filter.llm_tool(name="voice_speak")
-    async def speak_tool(self, event: AstrMessageEvent, text: str) -> str:
+    async def speak_tool(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+        emotion: str = "auto",
+        speed: float = 1.0,
+        volume: float = 1.0,
+        pitch: int = 0,
+    ) -> str:
         """由你根据当前对话自主决定是否用语音表达；闲聊、问候、表达情绪等适合时可以调用。选择文字就正常回复，不调用本工具。成功后不要再发送文字确认或重复正文。
 
         Args:
-            text(string): 需要说出的自然语言内容，不要包含思考过程或技术说明。
+            text(string): 要说出的正文。MiniMax 可用 <#0.3#> 停顿；Speech 2.8 可少量用 (laughs)、(chuckle)、(sighs)、(breath)，最多两处。不要包含思考或技术说明。
+            emotion(string): MiniMax 情绪：auto、happy、sad、angry、fearful、disgusted、surprised、calm，默认 auto。一次一种，不支持权重混合；千问用 auto。
+            speed(number): MiniMax 本次语速，0.85–1.2，正常 1.0、兴奋稍快、安慰稍慢；默认 1.0，不继承上一轮；千问用 1.0。
+            volume(number): MiniMax 本次音量，0.8–1.2，默认 1.0；千问用 1.0。
+            pitch(number): MiniMax 本次音高，-2 至 2 的整数，默认 0；千问用 0。不要频繁改变角色声音。
         """
-        return await self.tool_action(event, "说", text)
+        return await self.tool_action(
+            event,
+            "说",
+            text,
+            {
+                "emotion": emotion,
+                "speed": speed,
+                "volume": volume,
+                "pitch": pitch,
+            },
+        )
 
-    async def tool_action(self, event, verb, argument):
+    async def tool_action(self, event, verb, argument, style=None):
         # Provider/tool loops can repeat identical calls. Never send/pay twice per turn.
         calls = event.get_extra(PREFIX + "tool_calls")
         if calls is None:
@@ -278,7 +309,12 @@ class VoiceAddonPlugin(Star):
             )
         calls[signature] = None
         try:
-            result = await self.perform(event, verb, argument)
+            lock = event.get_extra(PREFIX + "speech_lock")
+            if lock is None:
+                lock = asyncio.Lock()
+                event.set_extra(PREFIX + "speech_lock", lock)
+            async with lock:
+                result = await self.perform(event, verb, argument, style)
         except PluginError as error:
             self.log_voice_failure(error)
             result = str(error)
@@ -371,6 +407,12 @@ class VoiceAddonPlugin(Star):
                 "发送方式：由现有聊天模型每条自主选择文字或语音",
                 "语音服务：" + str(provider),
                 "说话音色：" + str(voice),
+                "表达控制："
+                + (
+                    "由模型逐句选择（MiniMax）"
+                    if provider == "minimax"
+                    else "基础朗读（千问）"
+                ),
                 "API Key：" + filled,
             ]
         )

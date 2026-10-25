@@ -13,9 +13,10 @@
         ]
       },
       "speed": {
-        "description": "MiniMax 朗读速度",
+        "description": "手动朗读默认语速（MiniMax）",
         "type": "float",
-        "default": 1.0
+        "default": 1.0,
+        "hint": "用于 /说话；模型调用 voice_speak 时自行选择 0.85–1.2 的本次语速，默认 1.0。"
       },
       "max_characters": {
         "description": "每段语音最大字符数",
