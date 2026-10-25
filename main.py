@@ -16,15 +16,16 @@ import astrbot.api.message_components as Comp
 
 from .core import RequestGate, conversation_key, spoken_chunks
 from .errors import PluginError
-from .providers import Audio, CloudAudio, public_url
+from .providers import Audio, CloudAudio
+from .singing import SeedSinger, resolve_song, song_library
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 PREFIX = "voice_addon_"
 MEDIA_POLICY = """
 [语音与唱歌外挂]
 每条回复的表达形式由你根据当前对话、用户意愿和原有角色性格自主选择，不需要用户切换模式。
 选择文字时直接正常回复，不调用音频工具。聊天适合开口、表达情绪、问候或口头解释时，你可以自主调用 voice_speak，把真正要说的正文放进 text；不要只是宣称自己正在说话。
-选择唱歌时，有真实演唱音频直链可调用 voice_sing_cover；要创作一首新歌可调用 voice_compose_song。不要编造音频链接。
+选择唱歌时，可先调用 voice_list_songs 查看歌单，再把歌单中的歌名或真实演唱音频直链交给 voice_sing_cover；要创作一首新歌可调用 voice_compose_song。不要编造歌单内容或音频链接。
 用户对本次发送形式有明确要求时优先遵从。仅在本轮实际提供对应工具时调用；没有可用工具就自然回复文字，不输出伪造的调用代码。
 音频工具发送成功后，本轮不要再发送文字正文、相同内容的转录或成功确认，直接结束即可。工具返回只是给你的执行结果，不要照读给用户。
 若音频发送失败且没有声音送出，就用文字自然回答；不要假装已经成功，也不要向用户展示 API 字段或技术过程。
@@ -33,7 +34,8 @@ MEDIA_POLICY = """
 HELP = """语音与角色翻唱
 每条回复由你现有的模型自行决定发文字、语音还是唱歌，无需切换模式。
 /说话 今天也要开心 —— 手动测试语音
-/唱歌 https://…/song.mp3 —— 翻唱指定音频
+/唱歌 歌名或音频直链 —— 翻唱指定歌曲
+/voice 歌单 —— 查看可点唱的歌名
 /写歌 轻快中文流行 | 歌词 —— 手动生成歌曲
 /voice 状态 —— 查看音频配置
 配置面板用于填写语音/音乐 API 与音色。模型需启用工具调用，才能自主选择声音。"""
@@ -50,6 +52,7 @@ class VoiceAddonPlugin(Star):
         self.media_dir = self.root / "audio"
         self.media_dir.mkdir(parents=True, exist_ok=True)
         self.cloud = CloudAudio(config)
+        self.singer = SeedSinger(self.cloud, self.root)
         limits = config.get("limits", {})
         self.gate = RequestGate(
             int(limits.get("max_concurrent", 2)),
@@ -239,6 +242,8 @@ class VoiceAddonPlugin(Star):
                 await event.send(event.plain_result(HELP))
             elif verb in ("状态", "status"):
                 await event.send(event.plain_result(self.status(event)))
+            elif verb in ("歌单", "songs"):
+                await event.send(event.plain_result(self.available_songs()))
             elif verb in ("语音", "文字", "默认", "voice", "text", "default"):
                 await event.send(
                     event.plain_result(
@@ -274,7 +279,9 @@ class VoiceAddonPlugin(Star):
         if verb not in ("唱", "sing", "写歌", "music"):
             raise PluginError("发送 /voice 帮助 查看说话、唱歌和配置说明。")
         if not argument:
-            raise PluginError("用法：/唱歌 音频直链，或 /写歌 风格描述 | 歌词")
+            raise PluginError(
+                "用法：/唱歌 歌单中的歌名或音频直链，或 /写歌 风格描述 | 歌词"
+            )
         key = self.key(event)
         self.gate.enter(key)
         task = asyncio.current_task()
@@ -282,10 +289,8 @@ class VoiceAddonPlugin(Star):
         try:
             self.cleanup()
             if verb in ("唱", "sing"):
-                self.cloud.rvc_settings()
-                audio = await self.cloud.convert(
-                    Audio(url=public_url(argument), extension="mp3")
-                )
+                source_url = resolve_song(self.config, argument)
+                audio = await self.singer.cover(source_url)
             else:
                 prompt, separator, lyrics = argument.partition("|")
                 audio = await self.cloud.music(
@@ -309,12 +314,30 @@ class VoiceAddonPlugin(Star):
 
     @filter.llm_tool(name="voice_sing_cover")
     async def cover_tool(self, event: AstrMessageEvent, audio_url: str) -> str:
-        """由你判断对话适合翻唱且有真实演唱音频直链时调用。不要把歌名或网页地址当成音频。成功后直接结束，不再重复发文字。
+        """由你判断对话适合翻唱时调用。可使用 voice_list_songs 返回的准确歌名，或真实演唱音频直链；不要编造歌曲链接。成功后直接结束，不再重复发文字。
 
         Args:
-            audio_url(string): 用户提供或现有工具取得的真实演唱音频公网直链。
+            audio_url(string): 已配置歌单中的准确歌名，或用户提供/现有工具取得的真实演唱音频公网直链。
         """
         return await self.tool_action(event, "唱", audio_url)
+
+    def available_songs(self):
+        names = [entry[0] for entry in song_library(self.config).values()]
+        return (
+            "可点唱的歌曲：\n" + "\n".join(names)
+            if names
+            else "歌单尚未配置，请用户提供歌曲音频直链；不要编造下载链接。"
+        )
+
+    @filter.llm_tool(name="voice_list_songs")
+    async def songs_tool(self, event: AstrMessageEvent) -> str:
+        """查询已配置歌单，获得可交给 voice_sing_cover 的准确歌名。此工具不发送消息，不代表已经唱歌。"""
+        if not self.event_enabled(event):
+            return "当前无法使用歌单。"
+        try:
+            return self.available_songs()
+        except PluginError as error:
+            return str(error)
 
     @filter.llm_tool(name="voice_compose_song")
     async def compose_tool(
@@ -462,9 +485,16 @@ class VoiceAddonPlugin(Star):
                 "发送方式：由现有聊天模型每条自主选择",
                 "语音服务：" + str(provider),
                 "说话音色：" + str(voice),
+                "翻唱：云端 Seed-VC（与说话音色共用参考声音）",
+                "翻唱服务地址："
+                + (
+                    "已填写（未验证）"
+                    if self.config.get("singing", {}).get("base_url")
+                    else "未填写"
+                ),
                 "MiniMax Key：" + filled("minimax", "MINIMAX_API_KEY"),
                 "千问 Key：" + filled("qwen", "DASHSCOPE_API_KEY"),
-                "Replicate Key：" + filled("rvc", "REPLICATE_API_TOKEN"),
+                "翻唱服务 Key：" + filled("singing", "SINGING_API_KEY"),
             ]
         )
 

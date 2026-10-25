@@ -9,7 +9,7 @@ import tempfile
 import unittest
 import wave
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import httpx
 
@@ -46,9 +46,8 @@ def config():
     cfg = defaults(json.loads((ROOT / "_conf_schema.json").read_text("utf-8")))
     cfg["minimax"]["api_key"] = "fake-minimax-secret"
     cfg["qwen"]["api_key"] = "fake-qwen-secret"
-    cfg["rvc"].update(
-        api_key="fake-rvc-secret",
-        voice_model_url="https://models.example.org/character.zip",
+    cfg["singing"].update(
+        api_key="fake-singing-secret", base_url="https://singing.example.org"
     )
     cfg["limits"]["cooldown_seconds"] = 0
     return cfg
@@ -105,71 +104,21 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
             (await api.speech("你好")).url, "https://audio.example.org/voice.wav"
         )
 
-    async def test_role_preflight_avoids_paid_tts_if_model_missing(self):
+    async def test_legacy_rvc_options_are_ignored_without_extra_requests(self):
         self.cfg["speech"]["character_conversion"] = True
-        self.cfg["rvc"]["voice_model_url"] = ""
-        handler = unittest.mock.Mock()
-        api = await self.client(handler)
-        with self.assertRaisesRegex(PluginError, "voice_model_url"):
-            await api.speech("你好")
-        handler.assert_not_called()
-
-    async def test_rvc_submit_poll_output_and_same_voice_for_speech(self):
-        self.cfg["speech"]["character_conversion"] = True
-        seen = []
-
-        def handler(request):
-            seen.append(request)
-            if request.url.path.endswith("t2a_v2"):
-                return httpx.Response(200, json={"data": {"audio": wav_bytes().hex()}})
-            if request.method == "POST":
-                body = json.loads(request.content)
-                self.assertEqual(
-                    body["input"]["rvc_model"], self.cfg["rvc"]["voice_model_url"]
-                )
-                self.assertTrue(
-                    body["input"]["song_input"].startswith("data:audio/wav;base64,")
-                )
-                self.assertEqual(body["version"], providers.RVC_VERSION)
-                self.assertIn("cancel-after", request.headers)
-                return httpx.Response(201, json={"id": "task01", "status": "starting"})
-            return httpx.Response(
-                200,
-                json={
-                    "id": "task01",
-                    "status": "succeeded",
-                    "output": "https://replicate.delivery/out.wav",
-                },
+        self.cfg["rvc"] = {"api_key": "old-secret"}
+        handler = unittest.mock.Mock(
+            return_value=httpx.Response(
+                200, json={"data": {"audio": wav_bytes().hex()}}
             )
-
+        )
         api = await self.client(handler)
-        with patch.object(providers.asyncio, "sleep", new=AsyncMock()):
-            result = await api.speech("你好")
-        self.assertEqual(result.url, "https://replicate.delivery/out.wav")
-        self.assertEqual(len(seen), 3)
-        self.assertFalse(api.pending)
-
-    async def test_rvc_poll_error_cancels_cloud_job(self):
-        requests = []
-
-        def handler(request):
-            requests.append(request)
-            if request.url.path.endswith("/cancel"):
-                return httpx.Response(200, json={"status": "canceled"})
-            if request.method == "POST":
-                return httpx.Response(201, json={"id": "task02", "status": "starting"})
-            return httpx.Response(503, text="secret request details")
-
-        api = await self.client(handler)
-        with patch.object(providers.asyncio, "sleep", new=AsyncMock()):
-            with self.assertRaises(PluginError) as error:
-                await api.convert(
-                    providers.Audio(url="https://audio.example.org/song.mp3")
-                )
-        self.assertNotIn("secret", str(error.exception))
-        self.assertTrue(str(requests[-1].url).endswith("/cancel"))
+        await api.speech("你好")
+        self.assertEqual(handler.call_count, 1)
+        self.assertFalse(hasattr(api, "convert"))
 
     async def test_minimax_music_lyrics_optimizer_only_without_lyrics(self):
+        self.cfg["music"]["enabled"] = True
         bodies = []
 
         def handler(request):
@@ -184,12 +133,19 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(bodies[0]["lyrics_optimizer"])
         self.assertFalse(bodies[1]["lyrics_optimizer"])
 
+    async def test_new_song_generation_is_disabled_before_any_paid_request(self):
+        handler = unittest.mock.Mock()
+        api = await self.client(handler)
+        with self.assertRaisesRegex(PluginError, "历史接口权限"):
+            await api.music("轻快流行")
+        handler.assert_not_called()
+
     async def test_audio_download_does_not_leak_key_across_redirect(self):
         headers = []
 
         def handler(request):
             headers.append((request.url.host, request.headers.get("authorization")))
-            if request.url.host == "replicate.delivery":
+            if request.url.host == "singing.example.org":
                 return httpx.Response(
                     302, headers={"location": "https://cdn.example.org/audio.wav"}
                 )
@@ -205,14 +161,16 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
             ),
         ):
             path = await api.download(
-                providers.Audio(url="https://replicate.delivery/out.wav"),
+                providers.Audio(
+                    url="https://singing.example.org/v1/jobs/example/audio"
+                ),
                 Path(folder) / "audio.wav",
             )
             self.assertEqual(path.read_bytes(), wav_bytes())
         self.assertEqual(
             headers,
             [
-                ("replicate.delivery", "Bearer fake-rvc-secret"),
+                ("singing.example.org", "Bearer fake-singing-secret"),
                 ("cdn.example.org", None),
             ],
         )
@@ -282,6 +240,9 @@ class CoreTests(unittest.TestCase):
         self.assertNotIn("dsh", schema)
         self.assertNotIn("auto_chat", schema)
         self.assertNotIn("reply_mode", schema)
+        self.assertNotIn("rvc", schema)
+        self.assertNotIn("seedvc", schema)
+        self.assertNotIn("character_conversion", schema["speech"]["items"])
         self.assertNotIn("deepseek", (ROOT / "requirements.txt").read_text("utf-8"))
         self.assertFalse(hasattr(core, "DshEngine"))
 

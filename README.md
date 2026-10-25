@@ -1,114 +1,111 @@
 # 语音与角色翻唱 · AstrBot 插件
 
-**给已经能聊天的 QQ 机器人加上说话和唱歌功能。** 复用你在 AstrBot 中配置好的语言模型、人格、记忆和消息触发规则。插件只负责声音，不再启动另一套聊天模型，不需要 DeepSeek API Key。
+给已经能聊天的 QQ 机器人增加说话与指定歌曲翻唱。复用现有语言模型、人格和记忆，**每条由模型自主决定发文字还是声音；声音实际发送成功后不再重复发文字。** 不需要 DeepSeek API 或另一套聊天模型。
 
-当前版本：**0.3.0**。主要面向 QQ 的 OneBot v11（`aiocqhttp`）链路。默认音色：**MiniMax 萌萌女童 `lovely_girl`**。
+当前版本 **0.4.0**，面向 QQ OneBot v11（`aiocqhttp`）。默认说话音色为 MiniMax **萌萌女童 `lovely_girl`**。插件本机只需 Python 依赖 `httpx`，不安装 PyTorch、Seed-VC 或任何角色权重。
 
-## 模型自己决定怎么回复
+## 下载安装
 
-**每条消息由你现有的语言模型自主选择发文字、语音，还是唱歌。** 配置页由你填写 API、音色、地址和调用限制，里面没有固定“只发文字/只发语音”的开关。
+从 [v0.4.0 Release](https://github.com/Xtdzs/astrbot_plugin_dsh_voice/releases/tag/v0.4.0) 下载：
 
-| 模型本条的选择 | 插件执行的动作 |
-| --- | --- |
-| 文字 | 直接发送模型原本的文字回复，不调用 TTS |
-| 语音 | 模型调用 `voice_speak`，插件合成并发送声音；不再重复发文字正文或成功确认 |
-| 翻唱或创作歌曲 | 模型调用 `voice_sing_cover` 或 `voice_compose_song`，发送歌曲；不再重复发文字确认 |
+- **`astrbot_plugin_dsh_voice-v0.4.0.zip`**：在 AstrBot WebUI → 插件 → 安装插件 → 文件上传，直接选择，无需解压。
+- **`seedvc-cloud-v0.4.0.zip`**：独立云端 GPU 服务部署包，翻唱时需要；不要导入 AstrBot，不会随插件安装其依赖。
 
-模型可根据聊天语境、当前用户意愿及已有角色性格决定。用户可以自然地说“这句打字回我”“想听你说”“唱首开心的歌”，无需切换固定模式；没有指定时，模型仍可自己判断。下一条回复重新选择，上一条用语音不会把后续对话锁定为语音。
+也可通过插件安装页的 URL 入口填写本仓库地址 `https://github.com/Xtdzs/astrbot_plugin_dsh_voice`。保存配置并重载，在当前模型/人格中允许使用本插件的工具。原模型/执行器需支持工具调用，才能自行选择声音；手动指令可用于检查音频配置。
 
-### 让模型能使用声音工具
+升级直接上传新版插件 ZIP。插件标识保留旧名以支持覆盖升级；旧 DSH、固定回复模式、Replicate/RVC 设置不再读取。0.4.0 删除了 RVC 和 Replicate 调用；旧版 RVC 模型 ZIP 与 Token 无需迁移，翻唱改配下文的独立服务。
 
-在 AstrBot 中，确保当前聊天模型/执行器支持工具调用，并允许当前人格使用本插件的工具。插件会为原模型补充稳定的工具使用说明，保留已有角色设定，不另配判断模型或 DeepSeek API。
+## 先跑通说话
 
-- `voice_speak`：模型觉得适合开口、问候、表达情绪或口头解释时可自主调用。
-- `voice_sing_cover`：已有真实演唱音频直链时可选择翻唱，不会根据歌名编造链接。
-- `voice_compose_song`：对话适合一首新歌时可选择生成歌曲。
-
-如果模型或执行器不支持工具调用，原来的文字聊天仍然可用；手动 `/说话`、`/唱歌`、`/写歌` 可用于测试音频配置。实际选择频率和表达风格由你现有模型及人格决定，插件不按概率强制转换。
-
-音频实际送出之后才抑制文字。失败时把结果交回原模型自然用文字回答，不假装成功。重复的相同工具调用在同一条消息内不会重复发送或重复请求付费服务。流式正文会暂存到本轮选择确定后再投递，避免先发出文字后模型又选择语音。原有图片等非文字媒体保留。
-
-## 安装或升级
-
-1. 从 [Release](https://github.com/Xtdzs/astrbot_plugin_dsh_voice/releases/tag/v0.3.0) 下载 **`astrbot_plugin_dsh_voice-v0.3.0.zip`**。
-2. 无需解压，打开 **AstrBot WebUI → 插件 → 安装插件（＋）→ 文件上传**，选择 ZIP。
-3. 在插件配置中填写语音服务的 API Key、音色等参数，保存并重载；在当前模型/人格中允许使用本插件的声音工具。
-
-也可以在安装窗口的 URL 方式填写：
-
-```text
-https://github.com/Xtdzs/astrbot_plugin_dsh_voice
-```
-
-首次安装只需要联网下载 Python 依赖 `httpx`，不需要 GPU、DSH 或本地语音模型。若环境没有自动安装依赖，在 **AstrBot 实际使用的 Python 环境**执行 `python -m pip install -r requirements.txt`。
-
-从 0.1.x 或 0.2.x 升级时直接上传新版 ZIP。仓库名和插件标识沿用 `astrbot_plugin_dsh_voice` 以支持覆盖升级。新版不再使用 DSH/DeepSeek 对话配置，也不读取 0.2.x 的固定回复模式或模式记忆文件；无需手动清除旧模式。
-
-## 最少填什么
-
-### 用 MiniMax 说话（推荐先跑通）
-
-| 配置 | 填写内容 |
+| 配置 | 内容 |
 | --- | --- |
 | `speech.provider` | `minimax` |
-| `minimax.api_key` | MiniMax 的 API Key |
-| `minimax.voice_id` | 默认 `lovely_girl`，即萌萌女童 |
-| `speech.character_conversion` | 先保持 `false`，直接使用原生音色 |
+| `minimax.api_key` | 你的 MiniMax API Key，也可设置 `MINIMAX_API_KEY` |
+| `minimax.base_url` | 默认 `https://api.minimax.cn`，按账户地域调整 |
+| `minimax.speech_model` | 默认 `speech-2.8-turbo` |
+| `minimax.voice_id` | 默认 `lovely_girl`（萌萌女童） |
+| `speech.speed` | 默认 `1.0`；`0.7` 会明显更慢 |
 
-也可通过环境变量 `MINIMAX_API_KEY` 提供密钥。默认模型 `speech-2.8-turbo`，接口根地址 `https://api.minimax.cn`。请按账户实际地域与权限调整。
+测试 `/说话 嘿嘿，你终于来啦！`。说话本身不需要翻唱服务。
 
-配置并启用工具后，像平时一样和原来的机器人聊天，由模型自行决定什么时候开口。也可先发送 `/说话 嘿嘿，你终于来啦！` 验证 Key 和音色。
+千问可将 `speech.provider` 改为 `qwen`，填写 `qwen.api_key`（或环境变量 `DASHSCOPE_API_KEY`），默认 `qwen3-tts-flash` 与 `Cherry`；接口地址和 Key 需匹配北京/新加坡地域。这些是语音模型，聊天模型仍使用 AstrBot 原配置。
 
-### 用千问说话
+## 让说话音色唱指定歌曲
 
-将 `speech.provider` 改为 `qwen`，填写 `qwen.api_key`，选择该模型支持的 `qwen.voice`（默认 `Cherry`）。也可使用 `DASHSCOPE_API_KEY` 环境变量。
+流程：**歌曲音频 → 云端分离人声 → Seed-VC 参考说话音色转换歌声 → 混回原伴奏 → QQ 发送**。云端固定保留原曲调性和速度，避免与伴奏失配。效果是音色转换，不保证高音、咬字或身份相似度百分之百一致，需要先试听。
 
-默认非实时语音模型为 `qwen3-tts-flash`，北京接口根地址为 `https://dashscope.aliyuncs.com/api/v1`。新加坡账户要使用匹配地域的地址和 Key。这里的模型是**语音合成模型**，你的聊天模型仍由原 AstrBot 配置决定。
+Seed-VC 是 [Plachtaa 的开源项目](https://github.com/Plachtaa/seed-vc)，**不是字节跳动官方产品**。不需要训练角色模型或寻找 RVC ZIP。
 
-## 唱歌
+### 部署一次云端服务
 
-### 翻唱已有演唱音频
+解压独立云端包，在 Hugging Face 创建 **Docker Space**，上传包内文件，在设置中选择付费 CUDA GPU 并添加 Secret `COVER_API_KEY`。推荐从 24 GB 显存配置开始验证。也可部署到其他提供 HTTPS 的云端 GPU 主机。
 
-```text
-/唱歌 https://你的存储服务/song.mp3
-```
+完整步骤见 [云端部署说明](cloud_seedvc/README.md)。**这是需要自行部署的服务模板，不是已替你开通的公共 API；填 MiniMax Key 不能单独完成翻唱。** 云端镜像构建、真实 GPU 推理、听感及 QQ 实际发送尚未验收，当前以预发布方式提供。租用 GPU 通常按运行时长计费，空闲也可能收费，应设置休眠或暂停。
 
-配置 `rvc.api_key`（Replicate Token）与 `rvc.voice_model_url`（角色 RVC 模型 ZIP 公网直链）。ZIP 内含 `.pth`，可附带 `.index`。本版调用 Replicate 托管的 `meta-innovation/ultimate_rvc`，无需本地运行。
-
-当前输入是**演唱音频的直链**，不能只报歌名；插件不包含搜歌或角色模型训练。MiniMax 的 `lovely_girl` 是说话音色 ID，不能直接作为 RVC 模型使用，也没有随插件附送同音色的歌声模型。
-
-### 创作新歌
-
-```text
-/写歌 关于秋天的轻快中文民谣
-/写歌 中文流行 | [Verse]
-这里是你的歌词
-[Chorus]
-这里是副歌
-```
-
-需要 MiniMax 音乐 API 权限与余额。提供歌词时按歌词生成；省略歌词时交给音乐接口生成。生成音乐不需要另配语言模型 Key。开启 `music.character_conversion` 后，可再用同一份 RVC 模型转换歌声音色。
-
-## 常用指令
-
-| 指令 | 用途 |
+| 插件配置 | 内容 |
 | --- | --- |
-| `/说话 内容` | 用语音说出指定内容 |
-| `/唱歌 音频直链` | 云端 RVC 翻唱 |
-| `/写歌 描述`、`/写歌 描述 \| 歌词` | 生成歌曲 |
-| `/voice 帮助`、`/voice 状态` | 帮助和配置填写状态 |
+| `singing.base_url` | 部署后的 HTTPS 地址，如 `https://你的空间.hf.space` |
+| `singing.api_key` | 云端设置的 `COVER_API_KEY`；也可设置 `SINGING_API_KEY` |
+| `singing.reference_url` | 通常留空，自动用当前说话音色生成并缓存样本 |
+| `singing.timeout_seconds` | 默认 `1800`，含排队、分离、转换和合成 |
 
-上述指令是手动触发和配置测试入口，平时模型可以自主调用工具。兼容 `/voice 说`、`/voice 唱`、`/voice 写歌` 与旧的 `/dsh` 音频前缀。`/voice 语音`、`/voice 文字` 等旧模式命令只提示新版工作方式，不再保存固定模式。
+翻唱服务密钥和 MiniMax Key 是两个不同的密钥。这里使用本仓库的 HTTP 服务协议，**不能直接填写作者的 Gradio 演示地址**。
 
-## 音色与发送设置
+留空参考直链时，第一次翻唱会调用当前 MiniMax/千问说话 API 生成样本，后续复用；换音色会重新生成，样本缓存在插件数据目录 `voice-reference/`。也可配置干净的单人参考录音，云端仅使用前 25 秒。使用的声音需获准用于转换；MiniMax 预置音色的第三方转换使用范围以其条款为准。
 
-- 开启 `speech.character_conversion`，说话也会走 RVC。与歌声使用同一个模型有助于接近同一角色，但增加延迟和费用，建议先试听。只想要默认萌萌女童说话时保持关闭即可。
-- `speech.max_characters` 为每段朗读上限（默认 500，千问每段最多 600），`speech.max_reply_characters` 为总上限（默认 2000）。超过总上限时让工具明确失败，交回原模型用文字回答，不截断后声称全部说完。
-- 语音使用 WAV。云端返回其他格式时需要系统安装 FFmpeg；它仅做文件格式转换，不运行模型。
-- 歌曲默认以文件发送；希望以 QQ 语音发送时，将 `music.delivery` 设为 `record`，长语音仍受 QQ 适配器限制。
-- 如果同时开启 AstrBot 自带 TTS 或另一款语音转换插件，建议只保留一个自动配音来源，避免重复声音。外部执行器若不触发 AstrBot 的标准回复钩子，需要在实际环境检查兼容性。
-- `limits.allowed_users` 可限制付费功能的使用者。并发、调用间隔与音频大小上限均可配置。
-- 音频缓存保留 24 小时，后续调用时清理。不再存储回复模式，API Key 不会回显到 QQ。
+### 指定歌曲和歌名点唱
+
+先用一段短歌的公网音频直链测试：
+
+```text
+/唱歌 https://你的存储/歌曲片段.mp3
+```
+
+需要真实音频文件，不是下载页面、分享页或音乐网页。当前不包含搜歌或自动下载歌曲服务。
+
+在 `cover.songs` 列表中每项填 `歌名 | 音频直链`，例如：
+
+```text
+我的第一首歌 | https://你的存储/song.mp3
+```
+
+之后可以直接说“唱一下我的第一首歌”，模型能先查歌单再调用翻唱；手动也支持 `/唱歌 我的第一首歌`。歌名按歌单精确匹配，版本不同请分别命名。歌曲需有权处理，每个输入最多 40 MB，时长 1–600 秒。
+
+## 模型自主选择发送形式
+
+配置页只管理接口、声音、歌单和调用限制，不提供固定文字/语音模式。普通文字回复不会调用 TTS，下一条回复重新选择，不继承上一条的发送形式。
+
+| 工具 | 作用 |
+| --- | --- |
+| `voice_speak` | 模型根据语境选择开口说话，参数是真正要说的内容 |
+| `voice_list_songs` | 查询可点唱的准确歌名，不发送音频 |
+| `voice_sing_cover` | 用歌单名或真实音频直链翻唱 |
+| `voice_compose_song` | 可选新歌生成，需启用且有 MiniMax 历史音乐 API 权限 |
+
+插件为现有模型补充发送规则，不改变原人格。声音实际送出后抑制重复正文/成功确认，保留原有图片等非文字媒体。重复相同工具调用会去重，部分语音已送出时不会从头重复。流式正文暂存至本轮选择确定后再投递，避免先发文字后又发相同声音。失败时交回现有模型自然回答，不假装成功。
+
+### 可选：生成新歌
+
+**MiniMax 自 2026-08-20 起不再向新用户开放音乐付费 API，历史有权限用户可继续使用。** 因此 `music.enabled` 默认关闭。仅有历史权限时开启，使用 `/写歌 关于秋天的轻快民谣` 或 `/写歌 曲风 | 歌词`。这一路不保证采用说话音色，不能替代指定歌曲翻唱。
+
+## 常用指令与设置
+
+| 指令/配置 | 用途 |
+| --- | --- |
+| `/说话 内容` | 手动测试说话 |
+| `/唱歌 歌名或音频直链` | 指定歌曲翻唱 |
+| `/voice 歌单` | 查看可点唱歌曲 |
+| `/voice 状态`、`/voice 帮助` | 配置填写状态及帮助 |
+| `music.delivery = file/record` | 歌曲发文件或 QQ 语音，默认文件；长语音受适配器限制 |
+| `limits.allowed_users` | 限制可使用付费功能的 QQ 号，空列表表示不限 |
+
+`/voice 说/唱/写歌` 与旧 `/dsh` 前缀仍兼容。旧 `/voice 文字/语音/默认` 只解释自主选择，不再保存模式。
+
+每段朗读默认最多 500 字，千问最多 600 字；总上限默认 2000 字，超出明确失败并交回模型，不悄悄截断。MiniMax 和本云端翻唱服务返回 WAV，无需本机 FFmpeg；其他语音 API 返回非 WAV 时，需系统 FFmpeg 转码或改用文件发送。
+
+生成音频缓存默认保留 24 小时，由后续调用清理；固定参考样本长期复用，可手动删除 `voice-reference/` 强制重建。同一消息的重复工具调用不会再次计费；网络中断造成云端提交结果未知时，不会自动重试。卸载/超时会尝试取消正在运行的翻唱任务，取消失败时需在云端核查。
+
+不要同时开启多个自动配音插件，以免重复发送。真实选择频率由现有语言模型/人格决定；外部执行器是否触发标准 AstrBot 回复钩子，需要在实际环境检查。
 
 ## 开发与验证
 
@@ -119,16 +116,14 @@ ruff format --check .
 python scripts/package_plugin.py
 ```
 
-离线测试覆盖模型自主选择文字/声音、不继承上一条的形式、普通与流式去重、声音失败回退、重复工具调用不重复计费、原有图片保留、云端请求与角色翻唱。**真实付费 API、音色听感和 QQ 实际发送仍需部署后验证。**
+插件依赖只有根目录的 `requirements.txt`。如要运行独立云端 HTTP 协议测试，可额外安装 `fastapi` 与 `python-multipart`；模型推理不参与离线测试。测试覆盖消息发送、歌单、参考缓存、鉴权、任务取消及失败路径，**不等于真实 GPU/QQ/付费 API 验收**。
 
-打包脚本只收录白名单文件，版本从 `metadata.yaml` 读取，安装包输出到 `dist/`。不包含 API Key、用户音频、聊天日志、RVC 权重或原生运行时。采用 [MIT 许可证](LICENSE)，音色模型与云端服务各自遵循提供方条款。
+打包采用明确白名单，插件 ZIP 不包含云端依赖、GPU 模型、用户配置、密钥、音频、测试或运行时。独立云端 ZIP 仅包含部署源码与说明。插件采用 MIT 许可，上游代码/模型/服务各自遵循对应许可。
 
-## 官方参考
+## 参考
 
-- [AstrBot 消息事件与回复装饰](https://docs.astrbot.app/dev/star/guides/listen-message-event.html)
-- [AstrBot 工具注册](https://docs.astrbot.app/dev/star/guides/ai.html)
-- [AstrBot ZIP/URL 安装入口](https://docs.astrbot.app/use/webui.html#插件)
-- [MiniMax 同步语音合成](https://platform.minimax.cn/docs/api-reference/speech-t2a-http)
-- [MiniMax 音乐生成](https://platform.minimax.cn/docs/api-reference/music-generation)
-- [千问 TTS API](https://help.aliyun.com/zh/model-studio/qwen-tts-api)
-- [RVC 固定版本参数](https://replicate.com/meta-innovation/ultimate_rvc/versions/c7a02f18043c32141e29fd5d10f91bb06f44ed0a7bc491817609ab9de41017e4/api)
+- [AstrBot ZIP 安装](https://docs.astrbot.app/use/webui.html#插件) / [工具注册](https://docs.astrbot.app/dev/star/guides/ai.html)
+- [MiniMax 语音](https://platform.minimax.cn/docs/api-reference/speech-t2a-http) / [音乐及权限公告](https://platform.minimax.cn/docs/api-reference/music-generation)
+- [千问 TTS](https://help.aliyun.com/zh/model-studio/qwen-tts-api)
+- [Seed-VC](https://github.com/Plachtaa/seed-vc) / [Demucs](https://github.com/facebookresearch/demucs)
+- [Hugging Face Docker Spaces](https://huggingface.co/docs/hub/spaces-sdks-docker) / [GPU Spaces](https://huggingface.co/docs/hub/spaces-gpus)

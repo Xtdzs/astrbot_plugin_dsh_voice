@@ -10,6 +10,7 @@ files = [
     "main.py",
     "core.py",
     "providers.py",
+    "singing.py",
     "errors.py",
     "metadata.yaml",
     "_conf_schema.json",
@@ -17,9 +18,6 @@ files = [
     "README.md",
     "LICENSE",
     "CHANGELOG.md",
-    "scripts/package_plugin.py",
-    "tests/test_plugin.py",
-    "tests/test_routing.py",
 ]
 metadata = (root / "metadata.yaml").read_text("utf-8")
 version = re.search(
@@ -34,3 +32,13 @@ with ZipFile(target) as archive:
     assert archive.testzip() is None
     assert len(archive.namelist()) == len(files)
 print(f"Created {target} ({target.stat().st_size:,} bytes)")
+
+# GPU deployment is a separate archive: AstrBot never installs its requirements.
+cloud_target = root / "dist" / f"seedvc-cloud-v{version}.zip"
+with ZipFile(cloud_target, "w", ZIP_DEFLATED) as archive:
+    for name in ("Dockerfile", "app.py", "requirements.txt", "README.md"):
+        archive.write(root / "cloud_seedvc" / name, name)
+    archive.write(root / "LICENSE", "LICENSE")
+with ZipFile(cloud_target) as archive:
+    assert archive.testzip() is None
+print(f"Created {cloud_target} ({cloud_target.stat().st_size:,} bytes)")

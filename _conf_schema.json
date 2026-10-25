@@ -12,12 +12,6 @@
           "qwen"
         ]
       },
-      "character_conversion": {
-        "description": "说话也经 RVC 转成固定角色音色",
-        "type": "bool",
-        "default": false,
-        "hint": "需要配置 Replicate Key 和角色模型。会增加每次说话的费用和延迟。先单独测试翻唱。"
-      },
       "speed": {
         "description": "MiniMax 朗读速度",
         "type": "float",
@@ -63,12 +57,13 @@
         "description": "TTS 音色 ID",
         "type": "string",
         "default": "lovely_girl",
-        "hint": "默认萌萌女童。可填账户已创建的克隆音色 ID；它不能作为 RVC 模型使用。"
+        "hint": "默认萌萌女童。也可填账户创建的克隆音色 ID；翻唱会自动生成并缓存此音色的说话样本。"
       },
       "music_model": {
         "description": "歌曲生成模型",
         "type": "string",
-        "default": "music-3.0"
+        "default": "music-3.0",
+        "hint": "2026-08-20 起音乐付费 API 不再向新用户开放；有历史权限的账号才可继续调用。说话不受此音乐限制影响。"
       }
     }
   },
@@ -101,43 +96,46 @@
       }
     }
   },
-  "rvc": {
-    "description": "云端 RVC 固定角色音色（Replicate）",
+  "cover": {
+    "description": "指定歌曲翻唱与歌单",
     "type": "object",
     "items": {
+      "songs": {
+        "description": "可点唱歌单",
+        "type": "list",
+        "default": [],
+        "hint": "每项填写：歌名 | https://你的存储/song.mp3。配置后可直接说歌名；不自带搜歌服务。请使用有权处理的音频。"
+      }
+    }
+  },
+  "singing": {
+    "description": "云端 Seed-VC 翻唱（无需 RVC 或 Replicate）",
+    "type": "object",
+    "items": {
+      "base_url": {
+        "description": "翻唱服务地址",
+        "type": "string",
+        "default": "",
+        "hint": "填写部署包中的云端服务 HTTPS 地址，例如 https://你的空间.hf.space。不是 MiniMax 地址，也不是作者的 Gradio 演示地址。部署说明见 README。"
+      },
       "api_key": {
-        "description": "Replicate API Token",
+        "description": "翻唱服务密钥",
         "type": "string",
         "secret": true,
         "default": "",
-        "hint": "也可设置 REPLICATE_API_TOKEN。"
+        "hint": "填写云端设置的 COVER_API_KEY；也可设置环境变量 SINGING_API_KEY。不是 MiniMax API Key。"
       },
-      "voice_model_url": {
-        "description": "角色 RVC 模型 ZIP 公网直链",
+      "reference_url": {
+        "description": "固定参考音频直链（可留空）",
         "type": "string",
         "default": "",
-        "hint": "ZIP 内含 .pth，可选 .index；下载页面、MiniMax voice_id、SVC 模型不能直接替代。"
-      },
-      "version": {
-        "description": "ultimate_rvc 模型版本 ID",
-        "type": "string",
-        "default": "c7a02f18043c32141e29fd5d10f91bb06f44ed0a7bc491817609ab9de41017e4",
-        "hint": "固定版本保证参数一致，不能替换成参数不同的其他模型。"
-      },
-      "pitch": {
-        "description": "升降调（半音，-24 至 24）",
-        "type": "int",
-        "default": 0
-      },
-      "index_rate": {
-        "description": "音色索引强度（0 至 1）",
-        "type": "float",
-        "default": 0.3
+        "hint": "留空则用当前 MiniMax/千问音色生成并缓存样本，换音色自动重新生成；可自填干净单人音频直链，云端使用前 25 秒。参考声音需获准用于转换。"
       },
       "timeout_seconds": {
-        "description": "云端转换最大等待秒数",
+        "description": "翻唱任务最大等待秒数",
         "type": "int",
-        "default": 900
+        "default": 1800,
+        "hint": "包括排队、人声分离、歌声转换和伴奏合成，30 至 3600 秒。所有模型均在云端运行。"
       }
     }
   },
@@ -145,10 +143,11 @@
     "description": "歌曲发送与生成设置",
     "type": "object",
     "items": {
-      "character_conversion": {
-        "description": "生成新歌后转为同一角色音色",
+      "enabled": {
+        "description": "启用 MiniMax 新歌生成（可选）",
         "type": "bool",
-        "default": false
+        "default": false,
+        "hint": "2026-08-20 起不再向新用户开放音乐付费接口。仅历史有权限账号开启；指定歌曲翻唱不需要开启。"
       },
       "delivery": {
         "description": "歌曲发送方式",

@@ -3,9 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import ipaddress
-import re
 import socket
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -14,8 +12,6 @@ import httpx
 
 from .core import credential
 from .errors import PluginError
-
-RVC_VERSION = "c7a02f18043c32141e29fd5d10f91bb06f44ed0a7bc491817609ab9de41017e4"
 
 
 @dataclass
@@ -50,7 +46,6 @@ class CloudAudio:
         self.config = config
         # No global Authorization header: API keys never follow audio downloads.
         self.client = client or httpx.AsyncClient(timeout=httpx.Timeout(60, connect=15))
-        self.pending: set[str] = set()
 
     async def json(
         self, method: str, url: str, key: str, payload=None, timeout=120, headers=None
@@ -84,31 +79,8 @@ class CloudAudio:
     def minimax_key(self):
         return credential(self.config.get("minimax", {}), "api_key", "MINIMAX_API_KEY")
 
-    def rvc_settings(self):
-        cfg = self.config.get("rvc", {})
-        key = credential(cfg, "api_key", "REPLICATE_API_TOKEN")
-        model = str(cfg.get("voice_model_url") or "").strip()
-        if not model:
-            raise PluginError(
-                "请先配置 rvc.voice_model_url：角色 RVC 模型 ZIP 的公网直链（内含 .pth，可选 .index）。"
-            )
-        public_url(model)
-        version = str(cfg.get("version") or RVC_VERSION)
-        if not re.fullmatch(r"[a-f0-9]{64}", version):
-            raise PluginError(
-                "rvc.version 必须是与 ultimate_rvc 参数兼容的 64 位版本 ID。"
-            )
-        if (
-            not -24 <= int(cfg.get("pitch", 0)) <= 24
-            or not 0 <= float(cfg.get("index_rate", 0.3)) <= 1
-        ):
-            raise PluginError("RVC 的 pitch 需为 -24 至 24，index_rate 需为 0 至 1。")
-        return cfg, key, model, version
-
     def speech_preflight(self):
         cfg = self.config.get("speech", {})
-        if cfg.get("character_conversion", False):
-            self.rvc_settings()
         if cfg.get("provider", "minimax") == "qwen":
             credential(self.config.get("qwen", {}), "api_key", "DASHSCOPE_API_KEY")
         else:
@@ -187,15 +159,15 @@ class CloudAudio:
                 raise PluginError("MiniMax 没有返回有效音频。") from None
         else:
             raise PluginError("speech.provider 仅支持 minimax 或 qwen。")
-        if cfg.get("character_conversion", False):
-            return await self.convert(result)
         return result
 
     async def music(self, prompt: str, lyrics: str = "") -> Audio:
+        if not self.config.get("music", {}).get("enabled", False):
+            raise PluginError(
+                "尚未启用新歌生成；MiniMax 音乐 API 仅限有历史接口权限的账号，指定歌曲请使用翻唱。"
+            )
         if not 1 <= len(prompt) <= 2000 or len(lyrics) > 3500:
             raise PluginError("歌曲描述限 1–2000 字，歌词最多 3500 字。")
-        if self.config.get("music", {}).get("character_conversion", False):
-            self.rvc_settings()
         minimax = self.config.get("minimax", {})
         body = await self.json(
             "POST",
@@ -221,88 +193,7 @@ class CloudAudio:
         if not isinstance(url, str) or not url:
             raise PluginError("音乐接口没有返回音频链接。")
         result = Audio(url=public_url(url), extension="mp3")
-        if self.config.get("music", {}).get("character_conversion", False):
-            return await self.convert(result)
         return result
-
-    async def convert(self, source: Audio) -> Audio:
-        cfg, key, model, version = self.rvc_settings()
-        if source.url:
-            source_value = public_url(source.url)
-        elif source.content:
-            if len(source.content) > 8 * 1024 * 1024:
-                raise PluginError("待转换音频过大，请缩短语音或使用公网音频链接。")
-            mime = "audio/wav" if source.extension == "wav" else "audio/mpeg"
-            source_value = (
-                f"data:{mime};base64," + base64.b64encode(source.content).decode()
-            )
-        else:
-            raise PluginError("没有可转换的音频。")
-        deadline_seconds = max(30, min(float(cfg.get("timeout_seconds", 900)), 3600))
-        body = await self.json(
-            "POST",
-            "https://api.replicate.com/v1/predictions",
-            key,
-            {
-                "version": version,
-                "input": {
-                    "song_input": source_value,
-                    "rvc_model": model,
-                    "pitch": int(cfg.get("pitch", 0)),
-                    "index_rate": float(cfg.get("index_rate", 0.3)),
-                    "output_format": "wav",
-                },
-            },
-            timeout=60,
-            headers={"Cancel-After": f"{int(deadline_seconds)}s"},
-        )
-        pid = body.get("id", "")
-        if not re.fullmatch(r"[a-zA-Z0-9_-]+", str(pid)):
-            raise PluginError("RVC 接口未返回有效任务 ID。")
-        self.pending.add(pid)
-        terminal = False
-        try:
-            deadline = time.monotonic() + deadline_seconds
-            while True:
-                status = body.get("status")
-                if status in ("failed", "canceled"):
-                    terminal = True
-                    raise PluginError(
-                        "RVC 转换失败或被取消，请检查音色模型与音频格式。"
-                    )
-                if status == "succeeded":
-                    terminal = True
-                    output = body.get("output")
-                    if not isinstance(output, str):
-                        raise PluginError(
-                            "RVC 返回格式不兼容，请使用配置说明中的模型版本。"
-                        )
-                    return Audio(url=public_url(output), extension="wav")
-                if time.monotonic() >= deadline:
-                    raise PluginError(
-                        "RVC 转换超时，已尝试取消云端任务；可在 Replicate 控制台核查。"
-                    )
-                await asyncio.sleep(min(3, max(0, deadline - time.monotonic())))
-                body = await self.json(
-                    "GET",
-                    f"https://api.replicate.com/v1/predictions/{pid}",
-                    key,
-                    timeout=30,
-                )
-        finally:
-            if not terminal:
-                await self.cancel(pid, key)
-            self.pending.discard(pid)
-
-    async def cancel(self, pid: str, key: str):
-        try:
-            await self.client.post(
-                f"https://api.replicate.com/v1/predictions/{pid}/cancel",
-                headers={"Authorization": f"Bearer {key}"},
-                timeout=10,
-            )
-        except httpx.HTTPError:
-            pass
 
     async def download(self, audio: Audio, destination: Path) -> Path:
         maximum = (
@@ -326,12 +217,20 @@ class CloudAudio:
                     not ipaddress.ip_address(item[4][0]).is_global for item in addresses
                 ):
                     raise PluginError("云端音频地址不是公网地址。")
-                # Replicate outputs may require authentication, only for its delivery host.
+                # The singing key is scoped to its configured origin, never redirects.
                 headers = {}
-                if host == "replicate.delivery" or host.endswith(".replicate.delivery"):
-                    headers["Authorization"] = "Bearer " + credential(
-                        self.config.get("rvc", {}), "api_key", "REPLICATE_API_TOKEN"
+                service = urlsplit(
+                    str(self.config.get("singing", {}).get("base_url", ""))
+                )
+                parsed = urlsplit(url)
+                if (
+                    parsed.scheme == service.scheme == "https"
+                    and parsed.netloc == service.netloc
+                ):
+                    key = credential(
+                        self.config.get("singing", {}), "api_key", "SINGING_API_KEY"
                     )
+                    headers["Authorization"] = "Bearer " + key
                 async with self.client.stream(
                     "GET", url, headers=headers, follow_redirects=False, timeout=90
                 ) as response:
@@ -365,12 +264,4 @@ class CloudAudio:
                 destination.unlink(missing_ok=True)
 
     async def close(self):
-        if self.pending:
-            key = credential(
-                self.config.get("rvc", {}), "api_key", "REPLICATE_API_TOKEN"
-            )
-            await asyncio.gather(
-                *(self.cancel(pid, key) for pid in tuple(self.pending)),
-                return_exceptions=True,
-            )
         await self.client.aclose()
