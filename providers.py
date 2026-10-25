@@ -21,6 +21,34 @@ class Audio:
     extension: str = "wav"
 
 
+def service_url(value: str) -> str:
+    """Owner-configured service: HTTPS, or HTTP on the same machine only."""
+    parsed = urlsplit(value)
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise PluginError("翻唱服务地址不能包含账号、密码或查询参数。")
+    if parsed.scheme == "http" and parsed.hostname in ("127.0.0.1", "localhost", "::1"):
+        return value
+    public_url(value)
+    if parsed.scheme != "https":
+        raise PluginError(
+            "远程翻唱服务需使用 HTTPS；本机可使用 http://127.0.0.1:7860。"
+        )
+    return value
+
+
+def local_service_audio(value: str, base: str) -> bool:
+    parsed, service = urlsplit(value), urlsplit(base)
+    return (
+        parsed.scheme == service.scheme == "http"
+        and parsed.netloc == service.netloc
+        and parsed.hostname in ("127.0.0.1", "localhost", "::1")
+        and parsed.path.startswith(service.path.rstrip("/") + "/v1/jobs/")
+        and parsed.path.endswith("/audio")
+        and not parsed.username
+        and not parsed.password
+    )
+
+
 def public_url(value: str) -> str:
     parsed = urlsplit(value)
     if (
@@ -206,15 +234,22 @@ class CloudAudio:
                 raise PluginError("音频为空或超出大小限制。")
             destination.write_bytes(audio.content)
             return destination
-        url = public_url(audio.url)
+        base = str(self.config.get("singing", {}).get("base_url", ""))
+        url = (
+            audio.url if local_service_audio(audio.url, base) else public_url(audio.url)
+        )
         try:
             for _ in range(6):
                 host = urlsplit(url).hostname
                 addresses = await asyncio.to_thread(
                     socket.getaddrinfo, host, None, 0, socket.SOCK_STREAM
                 )
-                if not addresses or any(
-                    not ipaddress.ip_address(item[4][0]).is_global for item in addresses
+                if not addresses or (
+                    not local_service_audio(url, base)
+                    and any(
+                        not ipaddress.ip_address(item[4][0]).is_global
+                        for item in addresses
+                    )
                 ):
                     raise PluginError("云端音频地址不是公网地址。")
                 # The singing key is scoped to its configured origin, never redirects.
@@ -226,7 +261,7 @@ class CloudAudio:
                 if (
                     parsed.scheme == service.scheme == "https"
                     and parsed.netloc == service.netloc
-                ):
+                ) or local_service_audio(url, base):
                     key = credential(
                         self.config.get("singing", {}), "api_key", "SINGING_API_KEY"
                     )

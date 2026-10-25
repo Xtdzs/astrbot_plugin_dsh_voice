@@ -1,4 +1,4 @@
-"""Client for the separately deployed cloud Seed-VC singing service."""
+"""Client for the separately deployed local or cloud Seed-VC service."""
 
 from __future__ import annotations
 
@@ -8,13 +8,12 @@ import json
 import re
 import tempfile
 from pathlib import Path
-from urllib.parse import urlsplit
 
 import httpx
 
 from .core import credential
 from .errors import PluginError
-from .providers import Audio, public_url
+from .providers import Audio, public_url, service_url
 
 REFERENCE_TEXT = "你好呀，今天见到你真开心。窗外的阳光暖暖的，微风吹过树梢。我们一起听听音乐，聊聊有趣的事情吧。"
 
@@ -56,11 +55,9 @@ class SeedSinger:
         base = str(cfg.get("base_url") or "").strip().rstrip("/")
         if not base:
             raise PluginError(
-                "请先配置 singing.base_url：部署包中的云端 Seed-VC 服务地址。"
+                "请先配置 singing.base_url：本机或云端 Seed-VC 服务地址。"
             )
-        parsed = urlsplit(public_url(base))
-        if parsed.scheme != "https" or parsed.query or parsed.fragment:
-            raise PluginError("翻唱服务地址需为 HTTPS 根地址，不包含查询参数。")
+        service_url(base)
         key = credential(cfg, "api_key", "SINGING_API_KEY")
         return cfg, base, key
 
@@ -89,7 +86,7 @@ class SeedSinger:
     async def preflight(self):
         body = await self.request("GET", "/v1/health")
         if body.get("protocol") != "seedvc-cover-v1" or not body.get("ready"):
-            raise PluginError("云端翻唱服务尚未就绪或接口不兼容，请按部署文档检查。")
+            raise PluginError("翻唱服务尚未就绪或接口不兼容，请按部署文档检查。")
 
     async def reference(self):
         cfg, _, _ = self.settings()
@@ -169,7 +166,7 @@ class SeedSinger:
                         return Audio(url=base + "/v1/jobs/" + job_id + "/audio")
                     if status in ("failed", "canceled"):
                         raise PluginError(
-                            "云端翻唱失败或已取消，请检查歌曲时长、参考音频和云端 GPU 日志。"
+                            "翻唱失败或已取消，请检查歌曲时长、参考音频和翻唱服务日志。"
                         )
                     await asyncio.sleep(3)
                     current = await self.request("GET", "/v1/jobs/" + job_id)
@@ -182,7 +179,7 @@ class SeedSinger:
             except (asyncio.TimeoutError, TimeoutError):
                 await self.cancel(job_id)
                 raise PluginError(
-                    "云端翻唱超时，已尝试取消任务，请检查云端状态后再重试。"
+                    "翻唱超时，已尝试取消任务，请检查服务状态后再重试。"
                 ) from None
             except BaseException:
                 await self.cancel(job_id)

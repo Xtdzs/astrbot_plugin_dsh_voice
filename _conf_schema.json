@@ -109,33 +109,33 @@
     }
   },
   "singing": {
-    "description": "云端 Seed-VC 翻唱（无需 RVC 或 Replicate）",
+    "description": "Seed-VC 翻唱服务（本机 NPU 或云端）",
     "type": "object",
     "items": {
       "base_url": {
-        "description": "翻唱服务地址",
+        "description": "翻唱服务地址（本机默认 17860）",
         "type": "string",
-        "default": "",
-        "hint": "填写部署包中的云端服务 HTTPS 地址，例如 https://你的空间.hf.space。不是 MiniMax 地址，也不是作者的 Gradio 演示地址。部署说明见 README。"
+        "default": "http://127.0.0.1:17860",
+        "hint": "本机运行独立 Seed-VC 服务后填 http://127.0.0.1:17860；远程服务使用 HTTPS。模型依赖在独立环境安装，不加入 AstrBot。"
       },
       "api_key": {
         "description": "翻唱服务密钥",
         "type": "string",
         "secret": true,
         "default": "",
-        "hint": "填写云端设置的 COVER_API_KEY；也可设置环境变量 SINGING_API_KEY。不是 MiniMax API Key。"
+        "hint": "本机服务首次启动后从运行目录 api-key.txt 复制；远程服务填 COVER_API_KEY。也可设置 SINGING_API_KEY，不是 MiniMax Key。"
       },
       "reference_url": {
         "description": "固定参考音频直链（可留空）",
         "type": "string",
         "default": "",
-        "hint": "留空则用当前 MiniMax/千问音色生成并缓存样本，换音色自动重新生成；可自填干净单人音频直链，云端使用前 25 秒。参考声音需获准用于转换。"
+        "hint": "留空则用当前 MiniMax/千问音色生成并缓存样本。自填时使用干净单人音频直链。当前本机 NPU 版使用前 5 秒，云端版前 25 秒。"
       },
       "timeout_seconds": {
         "description": "翻唱任务最大等待秒数",
         "type": "int",
         "default": 1800,
-        "hint": "包括排队、人声分离、歌声转换和伴奏合成，30 至 3600 秒。所有模型均在云端运行。"
+        "hint": "包括排队、人声分离、转换、合成；30 至 3600 秒。本机首次编译和长歌曲可能需要较长时间。"
       }
     }
   },

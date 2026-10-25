@@ -175,6 +175,59 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_local_service_audio_download_is_authenticated(self):
+        self.cfg["singing"]["base_url"] = "http://127.0.0.1:17860"
+
+        def handler(request):
+            self.assertEqual(
+                request.headers["authorization"], "Bearer fake-singing-secret"
+            )
+            return httpx.Response(
+                200, content=wav_bytes(), headers={"content-type": "audio/wav"}
+            )
+
+        api = await self.client(handler)
+        with (
+            tempfile.TemporaryDirectory() as folder,
+            patch.object(
+                socket,
+                "getaddrinfo",
+                return_value=[(2, 1, 6, "", ("127.0.0.1", 17860))],
+            ),
+        ):
+            path = await api.download(
+                providers.Audio(
+                    url="http://127.0.0.1:17860/v1/jobs/" + "a" * 32 + "/audio"
+                ),
+                Path(folder) / "song.wav",
+            )
+            self.assertEqual(path.read_bytes(), wav_bytes())
+
+    async def test_local_service_exception_does_not_allow_arbitrary_private_fetches(
+        self,
+    ):
+        self.cfg["singing"]["base_url"] = "http://127.0.0.1:17860"
+        handler = unittest.mock.Mock()
+        api = await self.client(handler)
+        with tempfile.TemporaryDirectory() as folder:
+            for url in (
+                "http://127.0.0.1:17860/admin",
+                "http://127.0.0.1:17861/v1/jobs/a/audio",
+                "http://192.168.1.1/v1/jobs/a/audio",
+            ):
+                with self.subTest(url=url), self.assertRaises(PluginError):
+                    await api.download(
+                        providers.Audio(url=url), Path(folder) / "audio.wav"
+                    )
+        handler.assert_not_called()
+
+    async def test_remote_service_http_is_rejected_but_loopback_is_supported(self):
+        self.assertEqual(
+            providers.service_url("http://127.0.0.1:17860"), "http://127.0.0.1:17860"
+        )
+        with self.assertRaises(PluginError):
+            providers.service_url("http://example.org")
+
     async def test_reject_api_error_without_exposing_response(self):
         api = await self.client(
             lambda request: httpx.Response(

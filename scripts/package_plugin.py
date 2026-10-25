@@ -42,3 +42,22 @@ with ZipFile(cloud_target, "w", ZIP_DEFLATED) as archive:
 with ZipFile(cloud_target) as archive:
     assert archive.testzip() is None
 print(f"Created {cloud_target} ({cloud_target.stat().st_size:,} bytes)")
+
+local_target = root / "dist" / f"seedvc-local-v{version}.zip"
+with ZipFile(local_target, "w", ZIP_DEFLATED) as archive:
+    for name in (
+        "setup.py",
+        "download.py",
+        "diagnose.py",
+        "engine.py",
+        "server.py",
+        "separate.py",
+        "requirements.txt",
+        "README.md",
+    ):
+        archive.write(root / "local_seedvc" / name, "local_seedvc/" + name)
+    archive.write(root / "cloud_seedvc/app.py", "cloud_seedvc/app.py")
+    archive.write(root / "LICENSE", "LICENSE")
+with ZipFile(local_target) as archive:
+    assert archive.testzip() is None
+print(f"Created {local_target} ({local_target.stat().st_size:,} bytes)")

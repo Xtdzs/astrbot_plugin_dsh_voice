@@ -19,7 +19,7 @@ from .errors import PluginError
 from .providers import Audio, CloudAudio
 from .singing import SeedSinger, resolve_song, song_library
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 PREFIX = "voice_addon_"
 MEDIA_POLICY = """
 [语音与唱歌外挂]
@@ -485,7 +485,7 @@ class VoiceAddonPlugin(Star):
                 "发送方式：由现有聊天模型每条自主选择",
                 "语音服务：" + str(provider),
                 "说话音色：" + str(voice),
-                "翻唱：云端 Seed-VC（与说话音色共用参考声音）",
+                "翻唱：独立 Seed-VC 服务（本机或云端）",
                 "翻唱服务地址："
                 + (
                     "已填写（未验证）"
