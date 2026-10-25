@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import asyncio
 import importlib.util
 import io
 import json
 import socket
 import sys
 import tempfile
-import threading
-import types
 import unittest
 import wave
 from pathlib import Path
@@ -47,7 +44,6 @@ def config():
         }
 
     cfg = defaults(json.loads((ROOT / "_conf_schema.json").read_text("utf-8")))
-    cfg["dsh"]["api_key"] = "fake-dsh-secret"
     cfg["minimax"]["api_key"] = "fake-minimax-secret"
     cfg["qwen"]["api_key"] = "fake-qwen-secret"
     cfg["rvc"].update(
@@ -251,52 +247,8 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
                 providers.public_url(url)
 
 
-class FakeHarness:
-    def __init__(self, **kwargs):
-        self.kwargs = kwargs
-        self.started = []
-        self.resumed = []
-        self.closed = False
-
-    def start_session(self, sid):
-        self.started.append(sid)
-        return types.SimpleNamespace(
-            run=lambda text: types.SimpleNamespace(
-                finish_reason="completed", final_response="回复：" + text
-            )
-        )
-
-    def resume_session(self, sid):
-        self.resumed.append(sid)
-        return self.start_session(sid)
-
-    def close(self):
-        self.closed = True
-
-
-class EngineTests(unittest.IsolatedAsyncioTestCase):
-    async def test_sessions_are_isolated_resumed_and_reset(self):
-        with tempfile.TemporaryDirectory() as folder:
-            engine = core.DshEngine(
-                config()["dsh"], Path(folder), ROOT / "dsh_chat.patch.yml", FakeHarness
-            )
-            await engine.chat("group1-user1", "你好")
-            first = engine.index["group1-user1"]
-            await engine.chat("group1-user2", "你好")
-            self.assertNotEqual(first, engine.index["group1-user2"])
-            await engine.close()
-            restored = core.DshEngine(
-                config()["dsh"], Path(folder), ROOT / "dsh_chat.patch.yml", FakeHarness
-            )
-            await restored.chat("group1-user1", "记得我吗")
-            self.assertEqual(restored.harness.resumed, [first])
-            await restored.reset("group1-user1")
-            await restored.chat("group1-user1", "新对话")
-            self.assertNotEqual(first, restored.index["group1-user1"])
-            self.assertEqual(restored.harness.kwargs["profile"], "sdk-minimal")
-            await restored.close()
-
-    async def test_gate_and_key_do_not_mix_users_or_ambiguous_strings(self):
+class CoreTests(unittest.TestCase):
+    def test_gate_and_key_do_not_mix_users_or_ambiguous_strings(self):
         self.assertNotEqual(
             core.conversation_key("ab", "c"), core.conversation_key("a", "bc")
         )
@@ -309,36 +261,28 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         gate.leave("a")
         gate.enter("b")
 
-    async def test_cancelled_sdk_turn_is_closed_and_not_reentered(self):
-        entered, release = threading.Event(), threading.Event()
+    def test_spoken_chunks_keep_order_and_natural_boundaries(self):
+        text = "今天太阳很好。" * 12
+        chunks = core.spoken_chunks(text, limit=40)
+        self.assertEqual("".join(chunks), text)
+        self.assertTrue(all(len(chunk) <= 40 for chunk in chunks))
+        self.assertTrue(all(chunk.endswith("。") for chunk in chunks))
 
-        class Blocking(FakeHarness):
-            def start_session(self, sid):
-                def run(text):
-                    entered.set()
-                    release.wait(5)
-                    raise RuntimeError("closed")
+    def test_spoken_chunks_skip_code_and_keep_link_label(self):
+        text = "**你好**，看[这个例子](https://example.org)。\n```python\nprint('secret')\n```"
+        self.assertEqual(core.spoken_chunks(text), ["你好，看这个例子。"])
+        self.assertEqual(core.spoken_chunks("```python\nprint('x')\n```"), [])
 
-                return types.SimpleNamespace(run=run)
+    def test_long_reply_falls_back_without_silent_truncation(self):
+        with self.assertRaises(PluginError):
+            core.spoken_chunks("字" * 2001, max_total=2000)
 
-            def close(self):
-                release.set()
-                super().close()
-
-        with tempfile.TemporaryDirectory() as folder:
-            engine = core.DshEngine(
-                config()["dsh"], Path(folder), ROOT / "dsh_chat.patch.yml", Blocking
-            )
-            task = asyncio.create_task(engine.chat("a", "hello"))
-            await asyncio.to_thread(entered.wait, 3)
-            with self.assertRaises(PluginError):
-                await engine.chat("b", "other")
-            task.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await task
-            await asyncio.sleep(0.05)
-            self.assertFalse(engine.busy)
-            await engine.close()
+    def test_addon_has_no_chat_sdk_or_chat_key_configuration(self):
+        schema = json.loads((ROOT / "_conf_schema.json").read_text("utf-8"))
+        self.assertNotIn("dsh", schema)
+        self.assertNotIn("auto_chat", schema)
+        self.assertNotIn("deepseek", (ROOT / "requirements.txt").read_text("utf-8"))
+        self.assertFalse(hasattr(core, "DshEngine"))
 
 
 if __name__ == "__main__":

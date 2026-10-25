@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import json
+import os
 import re
 import shutil
 import time
@@ -8,157 +11,394 @@ import uuid
 from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools
 import astrbot.api.message_components as Comp
 
-from .core import DshEngine, RequestGate, conversation_key
+from .core import RequestGate, conversation_key, spoken_chunks
 from .errors import PluginError
 from .providers import Audio, CloudAudio, public_url
 
-HELP = """DSH 角色语音与翻唱
-/dsh 你好 —— DSH 对话，可附带语音
-/dsh 说 今天也要开心 —— 直接朗读
-/dsh 唱 https://…/song.mp3 —— 角色音色翻唱
-/dsh 写歌 轻快中文流行 | 你的歌词 —— 生成歌曲
-/dsh 写歌 关于秋天的民谣 —— 自动生成歌词和歌曲
-/dsh 重置 —— 开始新对话
-/dsh 状态 —— 查看配置是否填写
-翻唱需要音频直链和角色 RVC 模型；不能只输入歌名。
-API Key 请在 AstrBot 管理面板填写，不要发到 QQ。"""
+VERSION = "0.2.0"
+PREFIX = "voice_addon_"
+HELP = """语音与角色翻唱
+/voice 语音 —— 本会话中你的回复只发语音
+/voice 文字 —— 本会话中你的回复只发文字
+/voice 默认 —— 恢复管理面板的回复模式
+/voice 说 今天也要开心 —— 直接说出指定内容
+/voice 唱 https://…/song.mp3 —— 角色音色翻唱
+/voice 写歌 轻快中文流行 | 歌词 —— 生成歌曲
+/voice 状态 —— 查看模式和语音配置
+也支持 /说话、/唱歌、/写歌。翻唱需要音频直链和 RVC 模型。"""
 
 
-class DshVoicePlugin(Star):
+class VoiceAddonPlugin(Star):
+    """Add a voice to existing AstrBot replies; never request a chat completion."""
+
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
+        # Keep the installed identifier/data path so previous releases upgrade in place.
         self.root = Path(StarTools.get_data_dir("astrbot_plugin_dsh_voice")).resolve()
         self.media_dir = self.root / "audio"
         self.media_dir.mkdir(parents=True, exist_ok=True)
-        self.dsh = DshEngine(
-            config.get("dsh", {}),
-            self.root / "dsh",
-            Path(__file__).parent / "dsh_chat.patch.yml",
-        )
         self.cloud = CloudAudio(config)
         limits = config.get("limits", {})
         self.gate = RequestGate(
             int(limits.get("max_concurrent", 2)),
-            float(limits.get("cooldown_seconds", 5)),
+            float(limits.get("cooldown_seconds", 1)),
         )
         self.tasks: set[asyncio.Task] = set()
         self.closing = False
+        self.mode_path = self.root / "reply-modes.json"
+        try:
+            loaded = json.loads(self.mode_path.read_text("utf-8"))
+            self.modes = (
+                {str(k): v for k, v in loaded.items() if v in ("text", "voice")}
+                if isinstance(loaded, dict)
+                else {}
+            )
+        except FileNotFoundError:
+            self.modes = {}
+        except (ValueError, OSError):
+            self.modes = {}
+            logger.warning("[voice_addon] 回复模式文件无法读取，使用管理面板的模式。")
 
-    @filter.command("dsh", priority=100)
-    async def dsh_command(self, event: AstrMessageEvent):
-        """DSH 对话、语音与角色翻唱，发送 /dsh 帮助 查看说明。"""
-        event.set_extra("dsh_voice_handled", True)
-        event.stop_event()
-        raw = event.message_str.strip()
-        parts = re.split(r"\s+", raw, maxsplit=1)
-        await self.dispatch(event, parts[1] if len(parts) > 1 else "帮助")
+    def key(self, event):
+        return conversation_key(event.unified_msg_origin, str(event.get_sender_id()))
 
-    @filter.event_message_type(filter.EventMessageType.ALL, priority=-100)
-    async def auto_chat(self, event: AstrMessageEvent):
-        """Optional replacement for replies to AstrBot wake/mention messages."""
-        if not self.config.get("auto_chat", False) or event.get_extra(
-            "dsh_voice_handled", False
-        ):
-            return
-        if not getattr(event, "is_at_or_wake_command", False):
-            return
-        text = event.message_str.strip()
-        if not text or text.startswith("/"):
-            return
-        event.stop_event()
-        await self.dispatch(event, text, chat_only=True)
+    def mode(self, event):
+        value = self.modes.get(self.key(event), self.config.get("reply_mode", "voice"))
+        return "voice" if value == "voice" else "text"
 
     def allowed(self, sender: str) -> bool:
         users = self.config.get("limits", {}).get("allowed_users", [])
         return not users or sender in {str(x) for x in users}
 
-    async def dispatch(self, event: AstrMessageEvent, text: str, chat_only=False):
-        if self.closing:
+    def event_enabled(self, event):
+        return (
+            not self.closing
+            and self.allowed(str(event.get_sender_id()))
+            and not event.get_extra(PREFIX + "command", False)
+        )
+
+    @filter.on_decorating_result(priority=-100)
+    async def decorate_reply(self, event: AstrMessageEvent):
+        """Replace only a completed model reply's text after all audio is ready."""
+        if not self.event_enabled(event):
             return
-        sender = str(event.get_sender_id())
-        if not self.allowed(sender):
-            await event.send(event.plain_result("你不在此插件的使用名单中。"))
+        result = event.get_result()
+        if result is None or not result.is_llm_result() or not result.chain:
             return
-        key = conversation_key(event.unified_msg_origin, sender)
-        parts = re.split(r"\s+", text.strip(), maxsplit=1)
-        verb = parts[0]
-        argument = parts[1].strip() if len(parts) > 1 else ""
-        if not chat_only and verb in ("帮助", "help"):
-            await event.send(event.plain_result(HELP))
+        if event.get_extra(PREFIX + "tool_audio", False):
+            result.chain = [
+                part for part in result.chain if not isinstance(part, Comp.Plain)
+            ]
             return
-        if not chat_only and verb in ("状态", "status"):
-            await event.send(event.plain_result(self.status()))
+        if self.mode(event) == "text":
+            self.restore_stream(event)
             return
-        entered = False
+        if any(isinstance(part, Comp.Record) for part in result.chain):
+            result.chain = [
+                part for part in result.chain if not isinstance(part, Comp.Plain)
+            ]
+            return
+        text = "\n".join(
+            part.text for part in result.chain if isinstance(part, Comp.Plain)
+        ).strip()
+        if not text:
+            return
+        self.restore_stream(event)
+        try:
+            records = await self.make_records(event, text)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            # Leave the original result intact when TTS fails. No extra technical message.
+            self.log_voice_failure(error)
+            return
+        if records:
+            result.chain = [
+                part for part in result.chain if not isinstance(part, Comp.Plain)
+            ] + records
+
+    @filter.on_llm_request()
+    async def prepare_stream(self, event: AstrMessageEvent, req):
+        """Translate a streaming reply to audio before any answer text is delivered."""
+        if not self.event_enabled(event) or event.get_extra(PREFIX + "stream"):
+            return
+        original = event.send_streaming
+
+        async def wrapped(generator, *args, **kwargs):
+            async def audio_stream():
+                texts = []
+                has_audio = False
+                async for chain in generator:
+                    if self.mode(event) == "text" and not event.get_extra(
+                        PREFIX + "tool_audio", False
+                    ):
+                        yield chain
+                        continue
+                    kind = getattr(chain, "type", None)
+                    if kind == "break":
+                        # A tool round ended: speak the final answer, not its preamble.
+                        texts.clear()
+                        has_audio = False
+                        continue
+                    if kind in ("reasoning", "tool_call", "agent_stats"):
+                        continue
+                    if kind == "audio_chunk":
+                        has_audio = True
+                        yield chain
+                        continue
+                    parts = getattr(chain, "chain", None) or []
+                    texts.extend(
+                        part.text for part in parts if isinstance(part, Comp.Plain)
+                    )
+                    others = [
+                        part for part in parts if not isinstance(part, Comp.Plain)
+                    ]
+                    if others:
+                        has_audio |= any(
+                            isinstance(part, Comp.Record) for part in others
+                        )
+                        forwarded = copy.copy(chain)
+                        forwarded.chain = others
+                        yield forwarded
+                text = "".join(texts).strip()
+                if (
+                    not text
+                    or self.mode(event) == "text"
+                    or has_audio
+                    or event.get_extra(PREFIX + "tool_audio", False)
+                ):
+                    return
+                if self.closing:
+                    yield MessageChain([Comp.Plain(text)])
+                    return
+                try:
+                    records = await self.make_records(event, text)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    self.log_voice_failure(error)
+                    records = []
+                # Do not emit text until conversion is known to have failed or been skipped.
+                yield MessageChain(records if records else [Comp.Plain(text)])
+
+            try:
+                return await original(audio_stream(), *args, **kwargs)
+            finally:
+                self.restore_stream(event)
+
+        event.set_extra(PREFIX + "stream", (original, wrapped))
+        event.send_streaming = wrapped
+
+    def restore_stream(self, event):
+        saved = event.get_extra(PREFIX + "stream")
+        if saved:
+            original, wrapped = saved
+            if event.send_streaming is wrapped:
+                event.send_streaming = original
+            event.set_extra(PREFIX + "stream", None)
+
+    def log_voice_failure(self, error):
+        detail = str(error) if isinstance(error, PluginError) else type(error).__name__
+        logger.warning(f"[voice_addon] 语音未生成，保留文字：{detail}")
+
+    async def make_records(self, event, text):
+        speech = self.config.get("speech", {})
+        limit = min(
+            int(speech.get("max_characters", 500)),
+            600 if speech.get("provider", "minimax") == "qwen" else 9999,
+        )
+        chunks = spoken_chunks(
+            text, limit, int(speech.get("max_reply_characters", 2000))
+        )
+        if not chunks:
+            return []
+        key = self.key(event)
+        self.gate.enter(key)
         task = asyncio.current_task()
         self.tasks.add(task)
         try:
-            self.gate.enter(key)
-            entered = True
             self.cleanup()
-            if not chat_only and verb in ("重置", "reset"):
-                await self.dsh.reset(key)
-                await event.send(
-                    event.plain_result("已开始新对话。历史日志仍保留在插件数据目录。")
+            records = []
+            for chunk in chunks:
+                audio = await self.cloud.speech(chunk)
+                path = self.media_dir / f"dsh-{uuid.uuid4().hex}.{audio.extension}"
+                try:
+                    await self.cloud.download(audio, path)
+                    path = await self.ensure_wav(path)
+                    records.append(Comp.Record(file=str(path), url=str(path)))
+                except BaseException:
+                    path.unlink(missing_ok=True)
+                    raise
+            return records
+        finally:
+            self.gate.leave(key)
+            self.tasks.discard(task)
+
+    @filter.command("voice", alias={"语音", "dsh"}, priority=100)
+    async def voice_command(self, event: AstrMessageEvent):
+        """选择文字或语音回复，或使用朗读、翻唱、写歌功能。"""
+        event.set_extra(PREFIX + "command", True)
+        event.stop_event()
+        parts = re.split(r"\s+", event.message_str.strip(), maxsplit=1)
+        await self.dispatch(event, parts[1] if len(parts) > 1 else "帮助")
+
+    @filter.command("说话", priority=100)
+    async def say_command(self, event: AstrMessageEvent):
+        event.set_extra(PREFIX + "command", True)
+        event.stop_event()
+        parts = re.split(r"\s+", event.message_str.strip(), maxsplit=1)
+        await self.dispatch(event, "说 " + (parts[1] if len(parts) > 1 else ""))
+
+    @filter.command("唱歌", priority=100)
+    async def sing_command(self, event: AstrMessageEvent):
+        event.set_extra(PREFIX + "command", True)
+        event.stop_event()
+        parts = re.split(r"\s+", event.message_str.strip(), maxsplit=1)
+        await self.dispatch(event, "唱 " + (parts[1] if len(parts) > 1 else ""))
+
+    @filter.command("写歌", priority=100)
+    async def music_command(self, event: AstrMessageEvent):
+        event.set_extra(PREFIX + "command", True)
+        event.stop_event()
+        parts = re.split(r"\s+", event.message_str.strip(), maxsplit=1)
+        await self.dispatch(event, "写歌 " + (parts[1] if len(parts) > 1 else ""))
+
+    async def dispatch(self, event, text):
+        if self.closing:
+            return
+        if not self.allowed(str(event.get_sender_id())):
+            await event.send(event.plain_result("你不在此插件的使用名单中。"))
+            return
+        parts = re.split(r"\s+", text.strip(), maxsplit=1)
+        verb, argument = parts[0], parts[1].strip() if len(parts) > 1 else ""
+        try:
+            if verb in ("帮助", "help"):
+                await event.send(event.plain_result(HELP))
+            elif verb in ("状态", "status"):
+                await event.send(event.plain_result(self.status(event)))
+            elif verb in ("语音", "文字", "默认", "voice", "text", "default"):
+                key = self.key(event)
+                if verb in ("默认", "default"):
+                    self.modes.pop(key, None)
+                else:
+                    self.modes[key] = "voice" if verb in ("语音", "voice") else "text"
+                temp = self.mode_path.with_suffix(".tmp")
+                temp.write_text(json.dumps(self.modes), encoding="utf-8")
+                temp.replace(self.mode_path)
+                confirmation = (
+                    "好呀，接下来我用语音和你聊。"
+                    if self.mode(event) == "voice"
+                    else "好，接下来用文字回复你。"
                 )
-            elif not chat_only and verb in ("说", "say"):
-                if not argument:
-                    raise PluginError("用法：/dsh 说 要朗读的内容")
-                audio = await self.cloud.speech(argument)
-                await self.send_audio(event, audio, song=False)
-            elif not chat_only and verb in ("唱", "sing"):
-                if not argument:
-                    raise PluginError("用法：/dsh 唱 公网音频直链")
-                self.cloud.rvc_settings()
-                source = Audio(url=public_url(argument), extension="mp3")
-                await event.send(
-                    event.plain_result("开始角色翻唱，云端启动和转换可能需要几分钟。")
-                )
-                audio = await self.cloud.convert(source)
-                await self.send_audio(event, audio, song=True)
-            elif not chat_only and verb in ("写歌", "music"):
-                if not argument:
-                    raise PluginError("用法：/dsh 写歌 风格描述 | 歌词（歌词可省略）")
-                self.cloud.minimax_key()
-                if self.config.get("music", {}).get("character_conversion", False):
-                    self.cloud.rvc_settings()
-                prompt, separator, lyrics = argument.partition("|")
-                await event.send(event.plain_result("开始生成歌曲，可能需要几分钟。"))
-                audio = await self.cloud.music(
-                    prompt.strip(), lyrics.strip() if separator else ""
-                )
-                await self.send_audio(event, audio, song=True)
+                if self.mode(event) == "voice":
+                    try:
+                        records = await self.make_records(event, confirmation)
+                        for record in records:
+                            await event.send(event.chain_result([record]))
+                    except PluginError as error:
+                        self.log_voice_failure(error)
+                        await event.send(event.plain_result(confirmation))
+                else:
+                    await event.send(event.plain_result(confirmation))
             else:
-                limit = int(
-                    self.config.get("limits", {}).get("max_chat_characters", 2000)
-                )
-                if len(text) > limit:
-                    raise PluginError(f"对话输入最多 {limit} 字。")
-                reply = await self.dsh.chat(key, text)
-                # Text is delivered even when a later speech request fails.
-                await event.send(event.plain_result(reply))
-                if self.config.get("speech", {}).get("auto_speak", True):
-                    await self.send_audio(
-                        event, await self.cloud.speech(reply), song=False
-                    )
+                await self.perform(event, verb, argument)
         except PluginError as error:
             await event.send(event.plain_result(str(error)))
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            logger.error(f"[dsh_voice] 操作失败：{type(error).__name__}")
-            await event.send(
-                event.plain_result("操作失败，请检查插件配置、音频格式和平台发送权限。")
-            )
+            logger.error(f"[voice_addon] 操作失败：{type(error).__name__}")
+            await event.send(event.plain_result("这次没能发出来，请稍后再试。"))
+
+    async def perform(self, event, verb, argument):
+        if self.closing:
+            raise PluginError("插件正在关闭。")
+        if not self.allowed(str(event.get_sender_id())):
+            raise PluginError("你不在此插件的使用名单中。")
+        if verb in ("说", "say"):
+            if not argument:
+                raise PluginError("用法：/说话 要说的内容")
+            records = await self.make_records(event, argument)
+            if not records:
+                raise PluginError("这段内容没有可以朗读的文字。")
+            for record in records:
+                await event.send(event.chain_result([record]))
+            event.set_extra(PREFIX + "tool_audio", True)
+            return "语音已发送，不要重复发送相同文字。"
+        if verb not in ("唱", "sing", "写歌", "music"):
+            raise PluginError("发送 /voice 帮助 查看说话、唱歌和模式切换。")
+        if not argument:
+            raise PluginError("用法：/唱歌 音频直链，或 /写歌 风格描述 | 歌词")
+        key = self.key(event)
+        self.gate.enter(key)
+        task = asyncio.current_task()
+        self.tasks.add(task)
+        try:
+            self.cleanup()
+            if verb in ("唱", "sing"):
+                self.cloud.rvc_settings()
+                audio = await self.cloud.convert(
+                    Audio(url=public_url(argument), extension="mp3")
+                )
+            else:
+                prompt, separator, lyrics = argument.partition("|")
+                audio = await self.cloud.music(
+                    prompt.strip(), lyrics.strip() if separator else ""
+                )
+            await self.send_audio(event, audio, song=True)
+            event.set_extra(PREFIX + "tool_audio", True)
+            return "歌曲已发送，不要重复发送歌曲或技术过程说明。"
         finally:
-            if entered:
-                self.gate.leave(key)
+            self.gate.leave(key)
             self.tasks.discard(task)
+
+    @filter.llm_tool(name="voice_speak")
+    async def speak_tool(self, event: AstrMessageEvent, text: str) -> str:
+        """仅当用户明确要求用语音说出某段内容时调用，普通回复由插件自动处理。
+
+        Args:
+            text(string): 需要说出的自然语言内容，不要包含思考过程或技术说明。
+        """
+        return await self.tool_action(event, "说", text)
+
+    @filter.llm_tool(name="voice_sing_cover")
+    async def cover_tool(self, event: AstrMessageEvent, audio_url: str) -> str:
+        """用户明确要求翻唱且提供了演唱音频直链时调用，不能把歌名或网页地址当成音频。
+
+        Args:
+            audio_url(string): 用户提供的可公网下载的演唱音频直链。
+        """
+        return await self.tool_action(event, "唱", audio_url)
+
+    @filter.llm_tool(name="voice_compose_song")
+    async def compose_tool(
+        self, event: AstrMessageEvent, prompt: str, lyrics: str = ""
+    ) -> str:
+        """仅当用户明确要求创作一首新歌时调用，生成并发送歌曲。
+
+        Args:
+            prompt(string): 用户想要的歌曲主题、曲风和演唱风格。
+            lyrics(string): 用户提供或当前模型已经创作的歌词，可为空字符串。
+        """
+        return await self.tool_action(
+            event, "写歌", prompt + (" | " + lyrics if lyrics else "")
+        )
+
+    async def tool_action(self, event, verb, argument):
+        try:
+            return await self.perform(event, verb, argument)
+        except PluginError as error:
+            return str(error)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.error(f"[voice_addon] 工具失败：{type(error).__name__}")
+            return "音频发送失败，不要向用户声称已经成功。"
 
     async def send_audio(self, event, audio: Audio, song: bool):
         name = f"dsh-{uuid.uuid4().hex}"
@@ -238,9 +478,7 @@ class DshVoicePlugin(Star):
             if path.is_file() and path.stat().st_mtime < cutoff:
                 path.unlink(missing_ok=True)
 
-    def status(self):
-        import os
-
+    def status(self, event):
         def filled(section, env):
             return (
                 "已填写（未验证）"
@@ -248,37 +486,31 @@ class DshVoicePlugin(Star):
                 else "未填写"
             )
 
-        speech = self.config.get("speech", {})
+        provider = self.config.get("speech", {}).get("provider", "minimax")
+        voice = (
+            self.config.get("qwen", {}).get("voice") or "Cherry"
+            if provider == "qwen"
+            else self.config.get("minimax", {}).get("voice_id") or "lovely_girl"
+        )
         return "\n".join(
             [
-                "DSH 角色语音与翻唱 v0.1.1",
-                "DSH Key：" + filled("dsh", "DEEPSEEK_API_KEY"),
+                f"语音与角色翻唱 v{VERSION}",
+                "当前回复模式："
+                + ("只发语音" if self.mode(event) == "voice" else "只发文字"),
+                "语音服务：" + str(provider),
+                "说话音色：" + str(voice),
                 "MiniMax Key：" + filled("minimax", "MINIMAX_API_KEY"),
                 "千问 Key：" + filled("qwen", "DASHSCOPE_API_KEY"),
                 "Replicate Key：" + filled("rvc", "REPLICATE_API_TOKEN"),
-                "角色 RVC 模型："
-                + (
-                    "已填写"
-                    if self.config.get("rvc", {}).get("voice_model_url")
-                    else "未填写"
-                ),
-                "语音服务：" + str(speech.get("provider", "minimax")),
-                "说话转角色音色："
-                + ("开" if speech.get("character_conversion", False) else "关"),
-                "生成歌曲转角色音色："
-                + (
-                    "开"
-                    if self.config.get("music", {}).get("character_conversion", False)
-                    else "关"
-                ),
             ]
         )
 
     async def terminate(self):
         self.closing = True
-        active = [task for task in self.tasks if task is not asyncio.current_task()]
+        active = [
+            task for task in tuple(self.tasks) if task is not asyncio.current_task()
+        ]
         for task in active:
             task.cancel()
         await asyncio.gather(*active, return_exceptions=True)
         await self.cloud.close()
-        await self.dsh.close()

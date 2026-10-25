@@ -1,66 +1,215 @@
 {
-  "auto_chat": {"description": "使用 DSH 回复 AstrBot 唤醒或 @ 消息", "type": "bool", "default": false, "hint": "先用 /dsh 命令测试成功再开启。开启后会替代这些消息的 AstrBot 默认回复。"},
-  "dsh": {
-    "description": "DeepSeek Harness 对话核心", "type": "object", "items": {
-      "api_key": {"description": "DeepSeek API Key", "type": "string", "secret": true, "default": "", "hint": "也可设置 DEEPSEEK_API_KEY 环境变量。"},
-      "base_url": {"description": "DeepSeek 兼容接口地址", "type": "string", "default": "https://api.deepseek.com"},
-      "model": {"description": "对话模型", "type": "string", "default": "deepseek-v4-flash"},
-      "persona": {"description": "角色设定", "type": "text", "default": "你是一个温柔活泼的 QQ 角色机器人，喜欢和朋友聊天。用自然、简短的中文回复，通常不超过 120 字。不要输出 Markdown 排版，也不要声称已执行未执行的操作。"},
-      "max_tokens": {"description": "单次输出 Token 上限", "type": "int", "default": 1024},
-      "timeout_seconds": {"description": "对话超时秒数（另加 35 秒启动宽限）", "type": "int", "default": 120}
-    }
+  "reply_mode": {
+    "description": "回复方式：语音或文字",
+    "type": "string",
+    "default": "voice",
+    "options": [
+      "voice",
+      "text"
+    ],
+    "labels": [
+      "只发语音",
+      "只发文字"
+    ],
+    "hint": "语音成功时不发送同内容文字；转换失败或内容无法朗读时保留原文字。QQ 中可用 /voice 语音 或 /voice 文字 覆盖自己的模式。"
   },
   "speech": {
-    "description": "说话设置", "type": "object", "items": {
-      "provider": {"description": "语音 API", "type": "string", "default": "minimax", "options": ["minimax", "qwen"]},
-      "auto_speak": {"description": "DSH 文字回复后附带语音", "type": "bool", "default": true},
-      "character_conversion": {"description": "说话也经 RVC 转成固定角色音色", "type": "bool", "default": false, "hint": "需要配置 Replicate Key 和角色模型。会增加每次说话的费用和延迟。先单独测试翻唱。"},
-      "speed": {"description": "MiniMax 朗读速度", "type": "float", "default": 1.0},
-      "max_characters": {"description": "每次语音最大字符数", "type": "int", "default": 500, "hint": "千问接口最多 600 字。超长回复仍发送文字，但跳过语音并提示。"}
+    "description": "说话设置",
+    "type": "object",
+    "items": {
+      "provider": {
+        "description": "语音 API",
+        "type": "string",
+        "default": "minimax",
+        "options": [
+          "minimax",
+          "qwen"
+        ]
+      },
+      "character_conversion": {
+        "description": "说话也经 RVC 转成固定角色音色",
+        "type": "bool",
+        "default": false,
+        "hint": "需要配置 Replicate Key 和角色模型。会增加每次说话的费用和延迟。先单独测试翻唱。"
+      },
+      "speed": {
+        "description": "MiniMax 朗读速度",
+        "type": "float",
+        "default": 1.0
+      },
+      "max_characters": {
+        "description": "每段语音最大字符数",
+        "type": "int",
+        "default": 500,
+        "hint": "较长回复按自然停顿分成多段语音，不发送重复文字。千问每段最多 600 字。"
+      },
+      "max_reply_characters": {
+        "description": "单条回复的自动朗读总字数上限",
+        "type": "int",
+        "default": 2000,
+        "hint": "超过上限时保留完整文字，避免自动生成过多付费语音。不会截断原回复。"
+      }
     }
   },
   "minimax": {
-    "description": "MiniMax 语音及歌曲 API", "type": "object", "items": {
-      "api_key": {"description": "MiniMax API Key", "type": "string", "secret": true, "default": "", "hint": "也可设置 MINIMAX_API_KEY；语音或音乐需对应账户权限。"},
-      "base_url": {"description": "接口地址", "type": "string", "default": "https://api.minimax.cn", "hint": "可按账户地域修改，例如 api.minimaxi.com 或国际站地址。不要填写网页地址。"},
-      "speech_model": {"description": "语音模型", "type": "string", "default": "speech-2.8-turbo"},
-      "voice_id": {"description": "TTS 音色 ID", "type": "string", "default": "lovely_girl", "hint": "默认萌萌女童。可填账户已创建的克隆音色 ID；它不能作为 RVC 模型使用。"},
-      "music_model": {"description": "歌曲生成模型", "type": "string", "default": "music-3.0"}
+    "description": "MiniMax 语音及歌曲 API",
+    "type": "object",
+    "items": {
+      "api_key": {
+        "description": "MiniMax API Key",
+        "type": "string",
+        "secret": true,
+        "default": "",
+        "hint": "也可设置 MINIMAX_API_KEY；语音或音乐需对应账户权限。"
+      },
+      "base_url": {
+        "description": "接口地址",
+        "type": "string",
+        "default": "https://api.minimax.cn",
+        "hint": "可按账户地域修改，例如 api.minimaxi.com 或国际站地址。不要填写网页地址。"
+      },
+      "speech_model": {
+        "description": "语音模型",
+        "type": "string",
+        "default": "speech-2.8-turbo"
+      },
+      "voice_id": {
+        "description": "TTS 音色 ID",
+        "type": "string",
+        "default": "lovely_girl",
+        "hint": "默认萌萌女童。可填账户已创建的克隆音色 ID；它不能作为 RVC 模型使用。"
+      },
+      "music_model": {
+        "description": "歌曲生成模型",
+        "type": "string",
+        "default": "music-3.0"
+      }
     }
   },
   "qwen": {
-    "description": "千问语音 API", "type": "object", "items": {
-      "api_key": {"description": "百炼 API Key", "type": "string", "secret": true, "default": "", "hint": "也可设置 DASHSCOPE_API_KEY。"},
-      "base_url": {"description": "DashScope API 根地址", "type": "string", "default": "https://dashscope.aliyuncs.com/api/v1", "hint": "新加坡账户使用 https://dashscope-intl.aliyuncs.com/api/v1，Key 必须匹配地域。"},
-      "model": {"description": "非实时 TTS 模型", "type": "string", "default": "qwen3-tts-flash"},
-      "voice": {"description": "千问音色", "type": "string", "default": "Cherry"}
+    "description": "千问语音 API",
+    "type": "object",
+    "items": {
+      "api_key": {
+        "description": "百炼 API Key",
+        "type": "string",
+        "secret": true,
+        "default": "",
+        "hint": "也可设置 DASHSCOPE_API_KEY。"
+      },
+      "base_url": {
+        "description": "DashScope API 根地址",
+        "type": "string",
+        "default": "https://dashscope.aliyuncs.com/api/v1",
+        "hint": "新加坡账户使用 https://dashscope-intl.aliyuncs.com/api/v1，Key 必须匹配地域。"
+      },
+      "model": {
+        "description": "非实时 TTS 模型",
+        "type": "string",
+        "default": "qwen3-tts-flash"
+      },
+      "voice": {
+        "description": "千问音色",
+        "type": "string",
+        "default": "Cherry"
+      }
     }
   },
   "rvc": {
-    "description": "云端 RVC 固定角色音色（Replicate）", "type": "object", "items": {
-      "api_key": {"description": "Replicate API Token", "type": "string", "secret": true, "default": "", "hint": "也可设置 REPLICATE_API_TOKEN。"},
-      "voice_model_url": {"description": "角色 RVC 模型 ZIP 公网直链", "type": "string", "default": "", "hint": "ZIP 内含 .pth，可选 .index；下载页面、MiniMax voice_id、SVC 模型不能直接替代。"},
-      "version": {"description": "ultimate_rvc 模型版本 ID", "type": "string", "default": "c7a02f18043c32141e29fd5d10f91bb06f44ed0a7bc491817609ab9de41017e4", "hint": "固定版本保证参数一致，不能替换成参数不同的其他模型。"},
-      "pitch": {"description": "升降调（半音，-24 至 24）", "type": "int", "default": 0},
-      "index_rate": {"description": "音色索引强度（0 至 1）", "type": "float", "default": 0.3},
-      "timeout_seconds": {"description": "云端转换最大等待秒数", "type": "int", "default": 900}
+    "description": "云端 RVC 固定角色音色（Replicate）",
+    "type": "object",
+    "items": {
+      "api_key": {
+        "description": "Replicate API Token",
+        "type": "string",
+        "secret": true,
+        "default": "",
+        "hint": "也可设置 REPLICATE_API_TOKEN。"
+      },
+      "voice_model_url": {
+        "description": "角色 RVC 模型 ZIP 公网直链",
+        "type": "string",
+        "default": "",
+        "hint": "ZIP 内含 .pth，可选 .index；下载页面、MiniMax voice_id、SVC 模型不能直接替代。"
+      },
+      "version": {
+        "description": "ultimate_rvc 模型版本 ID",
+        "type": "string",
+        "default": "c7a02f18043c32141e29fd5d10f91bb06f44ed0a7bc491817609ab9de41017e4",
+        "hint": "固定版本保证参数一致，不能替换成参数不同的其他模型。"
+      },
+      "pitch": {
+        "description": "升降调（半音，-24 至 24）",
+        "type": "int",
+        "default": 0
+      },
+      "index_rate": {
+        "description": "音色索引强度（0 至 1）",
+        "type": "float",
+        "default": 0.3
+      },
+      "timeout_seconds": {
+        "description": "云端转换最大等待秒数",
+        "type": "int",
+        "default": 900
+      }
     }
   },
   "music": {
-    "description": "歌曲发送与生成设置", "type": "object", "items": {
-      "character_conversion": {"description": "生成新歌后转为同一角色音色", "type": "bool", "default": false},
-      "delivery": {"description": "歌曲发送方式", "type": "string", "default": "file", "options": ["file", "record"], "hint": "长歌曲推荐文件；QQ 官方接口不一定支持文件，按实际适配器选择。"},
-      "timeout_seconds": {"description": "MiniMax 音乐请求超时秒数", "type": "int", "default": 600}
+    "description": "歌曲发送与生成设置",
+    "type": "object",
+    "items": {
+      "character_conversion": {
+        "description": "生成新歌后转为同一角色音色",
+        "type": "bool",
+        "default": false
+      },
+      "delivery": {
+        "description": "歌曲发送方式",
+        "type": "string",
+        "default": "file",
+        "options": [
+          "file",
+          "record"
+        ],
+        "hint": "长歌曲推荐文件；QQ 官方接口不一定支持文件，按实际适配器选择。"
+      },
+      "timeout_seconds": {
+        "description": "MiniMax 音乐请求超时秒数",
+        "type": "int",
+        "default": 600
+      }
     }
   },
   "limits": {
-    "description": "调用与缓存设置", "type": "object", "items": {
-      "allowed_users": {"description": "允许使用的 QQ 号（空表示不限）", "type": "list", "default": []},
-      "max_concurrent": {"description": "同时处理的任务上限", "type": "int", "default": 2},
-      "cooldown_seconds": {"description": "每位用户的调用间隔秒数", "type": "int", "default": 5},
-      "max_chat_characters": {"description": "对话输入最大字符数", "type": "int", "default": 2000},
-      "max_audio_mb": {"description": "下载音频大小上限 MB", "type": "int", "default": 40},
-      "retention_hours": {"description": "音频缓存保留小时数", "type": "int", "default": 24}
+    "description": "调用与缓存设置",
+    "type": "object",
+    "items": {
+      "allowed_users": {
+        "description": "允许使用的 QQ 号（空表示不限）",
+        "type": "list",
+        "default": []
+      },
+      "max_concurrent": {
+        "description": "同时处理的任务上限",
+        "type": "int",
+        "default": 2
+      },
+      "cooldown_seconds": {
+        "description": "每位用户的调用间隔秒数",
+        "type": "int",
+        "default": 1
+      },
+      "max_audio_mb": {
+        "description": "下载音频大小上限 MB",
+        "type": "int",
+        "default": 40
+      },
+      "retention_hours": {
+        "description": "音频缓存保留小时数",
+        "type": "int",
+        "default": 24
+      }
     }
   }
 }

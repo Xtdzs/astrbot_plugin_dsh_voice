@@ -1,13 +1,13 @@
 name: astrbot_plugin_dsh_voice
-display_name: DSH 角色语音与翻唱
-desc: 通过 DeepSeek Harness 对话，使用 MiniMax/千问语音和云端 RVC 角色翻唱。
-version: 0.1.1
+display_name: 语音与角色翻唱
+desc: 为现有 AstrBot 回复添加语音，支持文字或语音模式、MiniMax/千问 TTS 和云端角色翻唱。
+version: 0.2.0
 author: Xtdzs
 repo: https://github.com/Xtdzs/astrbot_plugin_dsh_voice
 astrbot_version: '>=4.0.0'
 support_platforms:
   - aiocqhttp
 tags:
-  - deepseek
+  - voice
   - tts
   - rvc
