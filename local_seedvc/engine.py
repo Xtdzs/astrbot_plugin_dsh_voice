@@ -16,21 +16,9 @@ import time
 from types import SimpleNamespace
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--runtime", type=Path, required=True)
-    parser.add_argument("--source", type=Path, required=True)
-    parser.add_argument("--reference", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--device", choices=["NPU", "GPU", "CPU"], default="NPU")
-    parser.add_argument("--steps", type=int, default=30)
-    args = parser.parse_args()
-    root = args.runtime.resolve()
-    source, reference, output = (
-        args.source.resolve(),
-        args.reference.resolve(),
-        args.output.resolve(),
-    )
+def create_runtime(runtime, device="NPU", steps=30):
+    root = Path(runtime).resolve()
+    args = SimpleNamespace(device=device, steps=steps)
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     os.chdir(root / "seed-vc")
@@ -41,8 +29,8 @@ def main():
     import torch
     import yaml
 
-    # PyTorch 2.4 CPU multithread attention is unstable on the tested Panther Lake.
-    torch.set_num_threads(1)
+    # PyTorch 2.6 was verified stable with eight threads on the tested Panther Lake.
+    torch.set_num_threads(max(1, min(int(os.getenv("SEEDVC_CPU_THREADS", "8")), 16)))
     torch.set_num_interop_threads(1)
     torch.backends.cuda.enable_flash_sdp(False)
     torch.backends.cuda.enable_mem_efficient_sdp(False)
@@ -85,6 +73,7 @@ def main():
     if args.device not in core.available_devices:
         raise RuntimeError(f"OpenVINO device unavailable: {args.device}")
     original_loader = inference.load_models
+    cached_models = []
 
     class Estimator(torch.nn.Module):
         def __init__(self, model):
@@ -180,9 +169,13 @@ def main():
             return torch.from_numpy(value)
 
     def loader(options):
+        if cached_models:
+            report["load_seconds"] = 0.0
+            return cached_models[0]
         started = time.perf_counter()
         loaded = original_loader(options)
         loaded[0].cfm.estimator = Estimator(loaded[0].cfm.estimator)
+        cached_models.append(loaded)
         report["load_seconds"] = time.perf_counter() - started
         print(
             json.dumps({"stage": "models_loaded", "seconds": report["load_seconds"]}),
@@ -192,9 +185,9 @@ def main():
 
     inference.load_models = loader
     options = SimpleNamespace(
-        source=str(source),
-        target=str(reference),
-        output=str(output),
+        source="",
+        target="",
+        output="",
         diffusion_steps=args.steps,
         length_adjust=1.0,
         inference_cfg_rate=0.7,
@@ -208,12 +201,83 @@ def main():
         ),
         config=str(config_path),
     )
-    started = time.perf_counter()
-    inference.main(options)
-    report["total_seconds"] = time.perf_counter() - started
-    output.mkdir(parents=True, exist_ok=True)
-    (output / "benchmark.json").write_text(json.dumps(report, indent=2), "utf-8")
-    print(json.dumps(report), flush=True)
+    loader(options)
+
+    def convert(source, reference, output):
+        source, reference, output = (
+            Path(source).resolve(),
+            Path(reference).resolve(),
+            Path(output).resolve(),
+        )
+        options.source, options.target, options.output = (
+            str(source),
+            str(reference),
+            str(output),
+        )
+        report.clear()
+        report.update(
+            device=args.device, steps=args.steps, dit_calls=0, dit_seconds=0.0
+        )
+        torch.manual_seed(42)
+        started = time.perf_counter()
+        inference.main(options)
+        report["total_seconds"] = time.perf_counter() - started
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "benchmark.json").write_text(json.dumps(report, indent=2), "utf-8")
+        print(json.dumps(report), flush=True)
+        return dict(report)
+
+    return convert
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--runtime", type=Path, required=True)
+    parser.add_argument("--source", type=Path)
+    parser.add_argument("--reference", type=Path)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--device", choices=["NPU", "GPU", "CPU"], default="NPU")
+    parser.add_argument("--steps", type=int, default=30)
+    parser.add_argument("--worker", action="store_true")
+    args = parser.parse_args()
+    args.runtime = args.runtime.resolve()
+    for name in ("source", "reference", "output"):
+        if getattr(args, name) is not None:
+            setattr(args, name, getattr(args, name).resolve())
+    convert = create_runtime(args.runtime, args.device, args.steps)
+    if not args.worker:
+        if not all((args.source, args.reference, args.output)):
+            parser.error("source/reference/output are required outside worker mode")
+        convert(args.source, args.reference, args.output)
+        return
+
+    # Warm up real public example features before advertising readiness.
+    import soundfile as sf
+
+    root = args.runtime.resolve()
+    warm = root / "warmup"
+    warm.mkdir(exist_ok=True)
+    demo = next((root / "seed-vc/examples/source").glob("TECHNOPOLIS*.wav"))
+    info = sf.info(demo)
+    data, sr = sf.read(demo, start=info.samplerate * 2, frames=info.samplerate * 3)
+    sf.write(warm / "source.wav", data, sr)
+    sample = root / "seed-vc/examples/reference/s1p1.wav"
+    info = sf.info(sample)
+    data, sr = sf.read(sample, frames=info.samplerate * 5)
+    sf.write(warm / "reference.wav", data, sr)
+    convert(warm / "source.wav", warm / "reference.wav", warm / "output")
+    print("VOICE_READY " + json.dumps({"device": args.device}), flush=True)
+    for line in sys.stdin:
+        try:
+            task = json.loads(line)
+            convert(task["source"], task["reference"], task["output"])
+            result = {"success": True}
+        except Exception as error:
+            import traceback
+
+            traceback.print_exc()
+            result = {"success": False, "error": type(error).__name__}
+        print("VOICE_RESULT " + json.dumps(result), flush=True)
 
 
 if __name__ == "__main__":

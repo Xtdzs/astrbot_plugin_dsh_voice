@@ -1,7 +1,7 @@
 name: astrbot_plugin_dsh_voice
 display_name: 语音与角色翻唱
 desc: 让现有 AstrBot 模型自主选择文字、语音或唱歌，支持 MiniMax/千问 TTS、本机 NPU / 云端 Seed-VC 翻唱与可点唱歌单。
-version: 0.5.0
+version: 0.5.1
 author: Xtdzs
 repo: https://github.com/Xtdzs/astrbot_plugin_dsh_voice
 astrbot_version: '>=4.0.0'

@@ -6,6 +6,8 @@ import argparse
 import asyncio
 from contextlib import asynccontextmanager
 import json
+import hashlib
+import time
 import os
 from pathlib import Path
 import secrets
@@ -17,7 +19,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--runtime", type=Path, required=True)
     parser.add_argument("--device", choices=["NPU", "GPU", "CPU"], default="NPU")
-    parser.add_argument("--port", type=int, default=7860)
+    parser.add_argument("--port", type=int, default=17860)
     parser.add_argument("--steps", type=int, default=30)
     parser.add_argument("--vocals-only", action="store_true")
     options = parser.parse_args()
@@ -36,6 +38,11 @@ def main():
     import openvino as ov
     import soundfile as sf
     import uvicorn
+    from local_seedvc.worker import ResidentWorker
+
+    resident = ResidentWorker(root, options.device, options.steps)
+    cache = root / "song-cache"
+    cache.mkdir(exist_ok=True)
 
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     python = sys.executable
@@ -67,6 +74,22 @@ def main():
 
     async def render(job):
         folder = job.folder
+        identity = hashlib.sha256(
+            f"local-v2:{options.device}:{options.steps}:{options.vocals_only}".encode()
+        )
+        for name in ("song.audio", "reference.audio"):
+            identity.update((folder / name).stat().st_size.to_bytes(8, "big"))
+            with (folder / name).open("rb") as handle:
+                while chunk := handle.read(1024 * 1024):
+                    identity.update(chunk)
+        cached = cache / (identity.hexdigest() + ".wav")
+        if cached.is_file() and time.time() - cached.stat().st_mtime < 86400:
+            shutil.copyfile(cached, folder / "output.wav")
+            (root / "last-benchmark.json").write_text(
+                json.dumps({"cached": True, "device": options.device}), "utf-8"
+            )
+            job.stage = "cached"
+            return
         job.stage = "validating"
         song, sample = folder / "source.wav", folder / "reference.wav"
         await command(
@@ -122,22 +145,7 @@ def main():
             vocal, backing = stem_dir / "vocals.wav", stem_dir / "no_vocals.wav"
         job.stage = "converting"
         output_dir = folder / "converted"
-        await command(
-            python,
-            scripts / "engine.py",
-            "--runtime",
-            root,
-            "--source",
-            vocal,
-            "--reference",
-            sample,
-            "--output",
-            output_dir,
-            "--device",
-            options.device,
-            "--steps",
-            options.steps,
-        )
+        await resident.convert(vocal, sample, output_dir)
         files = list(output_dir.glob("*.wav"))
         if len(files) != 1:
             raise RuntimeError("No unique vocal output")
@@ -155,14 +163,52 @@ def main():
             ]
         args += ["-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", folder / "output.wav"]
         await command(*args)
+        shutil.copyfile(folder / "output.wav", cached)
+        # Bound the local result cache to 1 GiB and 24 hours.
+        entries = sorted(
+            cache.glob("*.wav"), key=lambda p: p.stat().st_mtime, reverse=True
+        )
+        size = 0
+        for path in entries:
+            size += path.stat().st_size
+            if size > 1024**3 or time.time() - path.stat().st_mtime > 86400:
+                path.unlink(missing_ok=True)
 
     @asynccontextmanager
     async def lifespan(app):
         api.ROOT.mkdir(parents=True, exist_ok=True)
-        api.GPU_READY = (
-            options.device in ov.Core().available_devices
-            and (root / "seed-vc/inference.py").is_file()
-        )
+        api.GPU_READY = False
+        if options.device not in ov.Core().available_devices:
+            raise RuntimeError("Requested OpenVINO device unavailable")
+
+        async def supervise_worker():
+            while True:
+                if not resident.alive:
+                    api.GPU_READY = False
+                    try:
+                        started = time.perf_counter()
+                        await resident.start()
+                        api.GPU_READY = True
+                        print(
+                            json.dumps(
+                                {
+                                    "stage": "ready",
+                                    "warmup_seconds": round(
+                                        time.perf_counter() - started, 3
+                                    ),
+                                }
+                            ),
+                            flush=True,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as error:
+                        print(
+                            "Worker warmup failed: " + type(error).__name__, flush=True
+                        )
+                await asyncio.sleep(5)
+
+        supervisor = asyncio.create_task(supervise_worker())
         print(
             json.dumps(
                 {
@@ -179,6 +225,9 @@ def main():
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        supervisor.cancel()
+        await asyncio.gather(supervisor, return_exceptions=True)
+        await resident.stop()
 
     api.render = render
     api.app.router.lifespan_context = lifespan

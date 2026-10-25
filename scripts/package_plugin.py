@@ -52,6 +52,9 @@ with ZipFile(local_target, "w", ZIP_DEFLATED) as archive:
         "engine.py",
         "server.py",
         "separate.py",
+        "worker.py",
+        "watchdog.py",
+        "install_autostart.ps1",
         "requirements.txt",
         "README.md",
     ):

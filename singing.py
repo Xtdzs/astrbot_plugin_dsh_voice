@@ -168,7 +168,11 @@ class SeedSinger:
                         raise PluginError(
                             "翻唱失败或已取消，请检查歌曲时长、参考音频和翻唱服务日志。"
                         )
-                    await asyncio.sleep(3)
+                    # Local cache hits should not wait for a cloud-length poll interval.
+                    delay = (
+                        0.5 if str(cfg.get("base_url", "")).startswith("http://") else 3
+                    )
+                    await asyncio.sleep(delay)
                     current = await self.request("GET", "/v1/jobs/" + job_id)
 
             try:

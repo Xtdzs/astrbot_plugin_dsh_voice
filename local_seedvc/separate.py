@@ -26,7 +26,9 @@ def main():
     if os.getenv("SEEDVC_ROOT"):
         torch.hub.set_dir(str(Path(os.environ["SEEDVC_ROOT"]).parent / "torch-cache"))
 
-    torch.set_num_threads(1)
+    torch.set_num_threads(
+        max(1, min(int(os.getenv("SEEDVC_SEPARATION_THREADS", "2")), 16))
+    )
     torch.backends.cuda.enable_flash_sdp(False)
     torch.backends.cuda.enable_mem_efficient_sdp(False)
     from demucs.separate import main as separate

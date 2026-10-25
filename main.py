@@ -19,7 +19,7 @@ from .errors import PluginError
 from .providers import Audio, CloudAudio
 from .singing import SeedSinger, resolve_song, song_library
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 PREFIX = "voice_addon_"
 MEDIA_POLICY = """
 [语音与唱歌外挂]
