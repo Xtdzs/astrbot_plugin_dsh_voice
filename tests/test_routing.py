@@ -134,20 +134,14 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.closing = False
         self.plugin.cloud = types.SimpleNamespace(
             speech=AsyncMock(return_value=providers.Audio(content=wav_bytes())),
-            music=AsyncMock(return_value=providers.Audio(content=wav_bytes())),
-            minimax_key=Mock(),
             close=AsyncMock(),
             download=AsyncMock(
                 side_effect=lambda audio, path: (path.write_bytes(wav_bytes()), path)[1]
             ),
         )
         self.plugin.cloud.config = self.plugin.config
-        self.plugin.singer = types.SimpleNamespace(
-            cover=AsyncMock(return_value=providers.Audio(content=wav_bytes()))
-        )
         self.record = main.Comp.Record(file="voice.wav", url="voice.wav")
         self.plugin.make_records = AsyncMock(return_value=[self.record])
-        self.plugin.send_audio = AsyncMock()
 
     async def stream(self, event, chunks):
         async def source():
@@ -453,54 +447,6 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.make_records.assert_not_awaited()
         self.assertFalse((self.plugin.root / "reply-modes.json").exists())
 
-    async def test_model_can_choose_song_and_suppress_confirmation(self):
-        event = Event("今天好开心")
-        reply = await self.plugin.compose_tool(
-            event, "一首庆祝今天的轻快中文短歌", "[Verse]\n今天天气真好"
-        )
-        self.assertIn("歌曲已发送", reply)
-        self.plugin.cloud.music.assert_awaited_once_with(
-            "一首庆祝今天的轻快中文短歌", "[Verse]\n今天天气真好"
-        )
-        self.plugin.send_audio.assert_awaited_once()
-        await self.plugin.decorate_reply(event)
-        self.assertEqual(event.result.chain, [])
-        self.plugin.make_records.assert_not_awaited()
-
-    async def test_cover_uses_seedvc_without_new_chat_or_tts_request(self):
-        event = Event("唱歌 https://audio.example.org/song.mp3")
-        await self.plugin.sing_command(event)
-        self.plugin.singer.cover.assert_awaited_once_with(
-            "https://audio.example.org/song.mp3"
-        )
-        self.plugin.cloud.speech.assert_not_awaited()
-        self.plugin.send_audio.assert_awaited_once()
-        self.assertEqual(event.messages, [])
-
-    async def test_model_lists_song_names_then_covers_selected_song(self):
-        self.plugin.config["cover"]["songs"] = [
-            "测试歌 | https://audio.example.org/song.mp3"
-        ]
-        event = Event("唱测试歌")
-        listing = await self.plugin.songs_tool(event)
-        self.assertIn("测试歌", listing)
-        self.assertNotIn("https://", listing)
-        self.assertEqual(event.messages, [])
-        await self.plugin.cover_tool(event, "测试歌")
-        self.plugin.singer.cover.assert_awaited_once_with(
-            "https://audio.example.org/song.mp3"
-        )
-        await self.plugin.decorate_reply(event)
-        self.assertEqual(event.result.chain, [])
-
-    async def test_unknown_song_never_calls_cloud_or_hides_text(self):
-        event = Event("唱不存在的歌")
-        result = await self.plugin.cover_tool(event, "不存在的歌")
-        self.assertIn("歌单中没有", result)
-        self.plugin.singer.cover.assert_not_awaited()
-        await self.plugin.decorate_reply(event)
-        self.assertTrue(event.result.chain)
-
     async def test_real_record_builder_runs_only_when_model_selects_voice(self):
         del self.plugin.make_records
         event = Event()
@@ -527,6 +473,26 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(event.result.chain, original)
         self.assertEqual(event.messages, [])
         self.assertFalse(self.plugin.gate.active)
+
+    async def test_legacy_song_configuration_never_starts_audio_work(self):
+        self.plugin.config.update(
+            singing={"base_url": "http://127.0.0.1:17860", "api_key": "old-key"},
+            music={"enabled": True},
+            cover={"songs": ["旧歌曲 | https://audio.example.org/song.mp3"]},
+        )
+        event = Event("voice 唱 旧歌曲")
+        await self.plugin.voice_command(event)
+        self.assertIn("说话和配置说明", event.messages[0])
+        self.plugin.make_records.assert_not_awaited()
+        self.plugin.cloud.speech.assert_not_awaited()
+        for name in (
+            "sing_command",
+            "music_command",
+            "cover_tool",
+            "songs_tool",
+            "compose_tool",
+        ):
+            self.assertFalse(hasattr(self.plugin, name))
 
     async def test_status_shows_autonomous_choice_and_never_exposes_keys(self):
         event = Event("voice 状态")

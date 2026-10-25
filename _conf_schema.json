@@ -32,7 +32,7 @@
     }
   },
   "minimax": {
-    "description": "MiniMax 语音及歌曲 API",
+    "description": "MiniMax 语音 API",
     "type": "object",
     "items": {
       "api_key": {
@@ -40,7 +40,7 @@
         "type": "string",
         "secret": true,
         "default": "",
-        "hint": "也可设置 MINIMAX_API_KEY；语音或音乐需对应账户权限。"
+        "hint": "也可设置 MINIMAX_API_KEY；需有语音接口权限和余额。"
       },
       "base_url": {
         "description": "接口地址",
@@ -57,13 +57,7 @@
         "description": "TTS 音色 ID",
         "type": "string",
         "default": "lovely_girl",
-        "hint": "默认萌萌女童。也可填账户创建的克隆音色 ID；翻唱会自动生成并缓存此音色的说话样本。"
-      },
-      "music_model": {
-        "description": "歌曲生成模型",
-        "type": "string",
-        "default": "music-3.0",
-        "hint": "2026-08-20 起音乐付费 API 不再向新用户开放；有历史权限的账号才可继续调用。说话不受此音乐限制影响。"
+        "hint": "默认萌萌女童。也可填账户创建的克隆音色 ID。"
       }
     }
   },
@@ -93,76 +87,6 @@
         "description": "千问音色",
         "type": "string",
         "default": "Cherry"
-      }
-    }
-  },
-  "cover": {
-    "description": "指定歌曲翻唱与歌单",
-    "type": "object",
-    "items": {
-      "songs": {
-        "description": "可点唱歌单",
-        "type": "list",
-        "default": [],
-        "hint": "每项填写：歌名 | https://你的存储/song.mp3。配置后可直接说歌名；不自带搜歌服务。请使用有权处理的音频。"
-      }
-    }
-  },
-  "singing": {
-    "description": "Seed-VC 翻唱服务（本机 NPU 或云端）",
-    "type": "object",
-    "items": {
-      "base_url": {
-        "description": "翻唱服务地址（本机默认 17860）",
-        "type": "string",
-        "default": "http://127.0.0.1:17860",
-        "hint": "本机运行独立 Seed-VC 服务后填 http://127.0.0.1:17860；远程服务使用 HTTPS。模型依赖在独立环境安装，不加入 AstrBot。"
-      },
-      "api_key": {
-        "description": "翻唱服务密钥",
-        "type": "string",
-        "secret": true,
-        "default": "",
-        "hint": "本机服务首次启动后从运行目录 api-key.txt 复制；远程服务填 COVER_API_KEY。也可设置 SINGING_API_KEY，不是 MiniMax Key。"
-      },
-      "reference_url": {
-        "description": "固定参考音频直链（可留空）",
-        "type": "string",
-        "default": "",
-        "hint": "留空则用当前 MiniMax/千问音色生成并缓存样本。自填时使用干净单人音频直链。当前本机 NPU 版使用前 5 秒，云端版前 25 秒。"
-      },
-      "timeout_seconds": {
-        "description": "翻唱任务最大等待秒数",
-        "type": "int",
-        "default": 1800,
-        "hint": "包括排队、人声分离、转换、合成；30 至 3600 秒。本机首次编译和长歌曲可能需要较长时间。"
-      }
-    }
-  },
-  "music": {
-    "description": "歌曲发送与生成设置",
-    "type": "object",
-    "items": {
-      "enabled": {
-        "description": "启用 MiniMax 新歌生成（可选）",
-        "type": "bool",
-        "default": false,
-        "hint": "2026-08-20 起不再向新用户开放音乐付费接口。仅历史有权限账号开启；指定歌曲翻唱不需要开启。"
-      },
-      "delivery": {
-        "description": "歌曲发送方式",
-        "type": "string",
-        "default": "file",
-        "options": [
-          "file",
-          "record"
-        ],
-        "hint": "长歌曲推荐文件；QQ 官方接口不一定支持文件，按实际适配器选择。"
-      },
-      "timeout_seconds": {
-        "description": "MiniMax 音乐请求超时秒数",
-        "type": "int",
-        "default": 600
       }
     }
   },

@@ -16,29 +16,23 @@ import astrbot.api.message_components as Comp
 
 from .core import RequestGate, conversation_key, spoken_chunks
 from .errors import PluginError
-from .providers import Audio, CloudAudio
-from .singing import SeedSinger, resolve_song, song_library
+from .providers import CloudAudio
 
-VERSION = "0.5.1"
+VERSION = "0.6.0"
 PREFIX = "voice_addon_"
-MEDIA_POLICY = """
-[语音与唱歌外挂]
+MEDIA_POLICY = """[语音外挂]
 每条回复的表达形式由你根据当前对话、用户意愿和原有角色性格自主选择，不需要用户切换模式。
 选择文字时直接正常回复，不调用音频工具。聊天适合开口、表达情绪、问候或口头解释时，你可以自主调用 voice_speak，把真正要说的正文放进 text；不要只是宣称自己正在说话。
-选择唱歌时，可先调用 voice_list_songs 查看歌单，再把歌单中的歌名或真实演唱音频直链交给 voice_sing_cover；要创作一首新歌可调用 voice_compose_song。不要编造歌单内容或音频链接。
 用户对本次发送形式有明确要求时优先遵从。仅在本轮实际提供对应工具时调用；没有可用工具就自然回复文字，不输出伪造的调用代码。
-音频工具发送成功后，本轮不要再发送文字正文、相同内容的转录或成功确认，直接结束即可。工具返回只是给你的执行结果，不要照读给用户。
-若音频发送失败且没有声音送出，就用文字自然回答；不要假装已经成功，也不要向用户展示 API 字段或技术过程。
-这段规则只补充发送方式，不改变你原有的人格、记忆和聊天能力。
-""".strip()
-HELP = """语音与角色翻唱
-每条回复由你现有的模型自行决定发文字、语音还是唱歌，无需切换模式。
+语音工具发送成功后，本轮不要再发送文字正文、相同内容的转录或成功确认，直接结束即可。工具返回只是给你的执行结果，不要照读给用户。
+若语音发送失败且没有声音送出，就用文字自然回答；不要假装已经成功，也不要向用户展示 API 字段或技术过程。
+这段规则只补充发送方式，不改变你原有的人格、记忆和聊天能力。"""
+HELP = """语音说话 · 精简版
+每条回复由现有模型自行决定发文字还是语音，无需切换模式。
 /说话 今天也要开心 —— 手动测试语音
-/唱歌 歌名或音频直链 —— 翻唱指定歌曲
-/voice 歌单 —— 查看可点唱的歌名
-/写歌 轻快中文流行 | 歌词 —— 手动生成歌曲
-/voice 状态 —— 查看音频配置
-配置面板用于填写语音/音乐 API 与音色。模型需启用工具调用，才能自主选择声音。"""
+/voice 状态 —— 查看语音配置
+/voice 帮助 —— 查看说明
+配置面板只需填写 MiniMax 或千问语音 API 与音色。现有模型需启用工具调用，才能自主选择语音。"""
 
 
 class VoiceAddonPlugin(Star):
@@ -52,7 +46,6 @@ class VoiceAddonPlugin(Star):
         self.media_dir = self.root / "audio"
         self.media_dir.mkdir(parents=True, exist_ok=True)
         self.cloud = CloudAudio(config)
-        self.singer = SeedSinger(self.cloud, self.root)
         limits = config.get("limits", {})
         self.gate = RequestGate(
             int(limits.get("max_concurrent", 2)),
@@ -202,7 +195,7 @@ class VoiceAddonPlugin(Star):
 
     @filter.command("voice", alias={"语音", "dsh"}, priority=100)
     async def voice_command(self, event: AstrMessageEvent):
-        """查看模型自主发送声音的配置，或手动测试朗读、翻唱与写歌。"""
+        """查看模型自主选择语音的配置，或手动测试朗读。"""
         event.set_extra(PREFIX + "command", True)
         event.stop_event()
         parts = re.split(r"\s+", event.message_str.strip(), maxsplit=1)
@@ -214,20 +207,6 @@ class VoiceAddonPlugin(Star):
         event.stop_event()
         parts = re.split(r"\s+", event.message_str.strip(), maxsplit=1)
         await self.dispatch(event, "说 " + (parts[1] if len(parts) > 1 else ""))
-
-    @filter.command("唱歌", priority=100)
-    async def sing_command(self, event: AstrMessageEvent):
-        event.set_extra(PREFIX + "command", True)
-        event.stop_event()
-        parts = re.split(r"\s+", event.message_str.strip(), maxsplit=1)
-        await self.dispatch(event, "唱 " + (parts[1] if len(parts) > 1 else ""))
-
-    @filter.command("写歌", priority=100)
-    async def music_command(self, event: AstrMessageEvent):
-        event.set_extra(PREFIX + "command", True)
-        event.stop_event()
-        parts = re.split(r"\s+", event.message_str.strip(), maxsplit=1)
-        await self.dispatch(event, "写歌 " + (parts[1] if len(parts) > 1 else ""))
 
     async def dispatch(self, event, text):
         if self.closing:
@@ -242,8 +221,6 @@ class VoiceAddonPlugin(Star):
                 await event.send(event.plain_result(HELP))
             elif verb in ("状态", "status"):
                 await event.send(event.plain_result(self.status(event)))
-            elif verb in ("歌单", "songs"):
-                await event.send(event.plain_result(self.available_songs()))
             elif verb in ("语音", "文字", "默认", "voice", "text", "default"):
                 await event.send(
                     event.plain_result(
@@ -276,32 +253,7 @@ class VoiceAddonPlugin(Star):
                 # Mark each delivered segment, including partial success before failure.
                 event.set_extra(PREFIX + "tool_audio", True)
             return "语音已发送，不要重复发送相同文字。"
-        if verb not in ("唱", "sing", "写歌", "music"):
-            raise PluginError("发送 /voice 帮助 查看说话、唱歌和配置说明。")
-        if not argument:
-            raise PluginError(
-                "用法：/唱歌 歌单中的歌名或音频直链，或 /写歌 风格描述 | 歌词"
-            )
-        key = self.key(event)
-        self.gate.enter(key)
-        task = asyncio.current_task()
-        self.tasks.add(task)
-        try:
-            self.cleanup()
-            if verb in ("唱", "sing"):
-                source_url = resolve_song(self.config, argument)
-                audio = await self.singer.cover(source_url)
-            else:
-                prompt, separator, lyrics = argument.partition("|")
-                audio = await self.cloud.music(
-                    prompt.strip(), lyrics.strip() if separator else ""
-                )
-            await self.send_audio(event, audio, song=True)
-            event.set_extra(PREFIX + "tool_audio", True)
-            return "歌曲已发送，不要重复发送歌曲或技术过程说明。"
-        finally:
-            self.gate.leave(key)
-            self.tasks.discard(task)
+        raise PluginError("发送 /voice 帮助 查看说话和配置说明。")
 
     @filter.llm_tool(name="voice_speak")
     async def speak_tool(self, event: AstrMessageEvent, text: str) -> str:
@@ -311,47 +263,6 @@ class VoiceAddonPlugin(Star):
             text(string): 需要说出的自然语言内容，不要包含思考过程或技术说明。
         """
         return await self.tool_action(event, "说", text)
-
-    @filter.llm_tool(name="voice_sing_cover")
-    async def cover_tool(self, event: AstrMessageEvent, audio_url: str) -> str:
-        """由你判断对话适合翻唱时调用。可使用 voice_list_songs 返回的准确歌名，或真实演唱音频直链；不要编造歌曲链接。成功后直接结束，不再重复发文字。
-
-        Args:
-            audio_url(string): 已配置歌单中的准确歌名，或用户提供/现有工具取得的真实演唱音频公网直链。
-        """
-        return await self.tool_action(event, "唱", audio_url)
-
-    def available_songs(self):
-        names = [entry[0] for entry in song_library(self.config).values()]
-        return (
-            "可点唱的歌曲：\n" + "\n".join(names)
-            if names
-            else "歌单尚未配置，请用户提供歌曲音频直链；不要编造下载链接。"
-        )
-
-    @filter.llm_tool(name="voice_list_songs")
-    async def songs_tool(self, event: AstrMessageEvent) -> str:
-        """查询已配置歌单，获得可交给 voice_sing_cover 的准确歌名。此工具不发送消息，不代表已经唱歌。"""
-        if not self.event_enabled(event):
-            return "当前无法使用歌单。"
-        try:
-            return self.available_songs()
-        except PluginError as error:
-            return str(error)
-
-    @filter.llm_tool(name="voice_compose_song")
-    async def compose_tool(
-        self, event: AstrMessageEvent, prompt: str, lyrics: str = ""
-    ) -> str:
-        """由你根据当前对话和用户意愿决定是否用一首新歌回应。生成并发送歌曲，成功后不要再发送文字正文或成功确认。
-
-        Args:
-            prompt(string): 用户想要的歌曲主题、曲风和演唱风格。
-            lyrics(string): 用户提供或当前模型已经创作的歌词，可为空字符串。
-        """
-        return await self.tool_action(
-            event, "写歌", prompt + (" | " + lyrics if lyrics else "")
-        )
 
     async def tool_action(self, event, verb, argument):
         # Provider/tool loops can repeat identical calls. Never send/pay twice per turn.
@@ -387,34 +298,6 @@ class VoiceAddonPlugin(Star):
         calls[signature] = result
         return result
 
-    async def send_audio(self, event, audio: Audio, song: bool):
-        name = f"dsh-{uuid.uuid4().hex}"
-        path = self.media_dir / f"{name}.{audio.extension}"
-        try:
-            await self.cloud.download(audio, path)
-            delivery = (
-                self.config.get("music", {}).get("delivery", "file")
-                if song
-                else "record"
-            )
-            if delivery == "file":
-                await event.send(
-                    event.chain_result(
-                        [Comp.File(file=str(path), name="角色歌曲" + path.suffix)]
-                    )
-                )
-            else:
-                path = await self.ensure_wav(path)
-                await event.send(
-                    event.chain_result([Comp.Record(file=str(path), url=str(path))])
-                )
-        except BaseException:
-            # Keep completed files until the retention window; adapters may read later.
-            # Failed/partial files are never sent and can be removed immediately.
-            if path.exists():
-                path.unlink(missing_ok=True)
-            raise
-
     async def ensure_wav(self, source: Path) -> Path:
         with source.open("rb") as handle:
             header = handle.read(12)
@@ -423,7 +306,7 @@ class VoiceAddonPlugin(Star):
         executable = shutil.which("ffmpeg")
         if executable is None:
             raise PluginError(
-                "云端返回的音频不是 WAV。请安装 FFmpeg 并加入 PATH，或将歌曲发送方式设为 file。"
+                "云端返回的音频不是 WAV。请安装 FFmpeg 并加入 PATH；MiniMax 默认请求 WAV，无需转换。"
             )
         target = source.with_name(source.stem + "-voice.wav")
         process = await asyncio.create_subprocess_exec(
@@ -443,6 +326,7 @@ class VoiceAddonPlugin(Star):
             str(target),
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
+            **({"creationflags": 0x08000000} if os.name == "nt" else {}),
         )
         try:
             await asyncio.wait_for(process.wait(), 60)
@@ -466,35 +350,28 @@ class VoiceAddonPlugin(Star):
                 path.unlink(missing_ok=True)
 
     def status(self, event):
-        def filled(section, env):
-            return (
-                "已填写（未验证）"
-                if self.config.get(section, {}).get("api_key") or os.getenv(env)
-                else "未填写"
-            )
-
         provider = self.config.get("speech", {}).get("provider", "minimax")
-        voice = (
-            self.config.get("qwen", {}).get("voice") or "Cherry"
+        section, env = (
+            ("qwen", "DASHSCOPE_API_KEY")
             if provider == "qwen"
-            else self.config.get("minimax", {}).get("voice_id") or "lovely_girl"
+            else ("minimax", "MINIMAX_API_KEY")
+        )
+        cfg = self.config.get(section, {})
+        voice = (
+            (cfg.get("voice") or "Cherry")
+            if provider == "qwen"
+            else (cfg.get("voice_id") or "lovely_girl")
+        )
+        filled = (
+            "已填写（未验证）" if cfg.get("api_key") or os.getenv(env) else "未填写"
         )
         return "\n".join(
             [
-                f"语音与角色翻唱 v{VERSION}",
-                "发送方式：由现有聊天模型每条自主选择",
+                f"语音说话 · 精简版 v{VERSION}",
+                "发送方式：由现有聊天模型每条自主选择文字或语音",
                 "语音服务：" + str(provider),
                 "说话音色：" + str(voice),
-                "翻唱：独立 Seed-VC 服务（本机或云端）",
-                "翻唱服务地址："
-                + (
-                    "已填写（未验证）"
-                    if self.config.get("singing", {}).get("base_url")
-                    else "未填写"
-                ),
-                "MiniMax Key：" + filled("minimax", "MINIMAX_API_KEY"),
-                "千问 Key：" + filled("qwen", "DASHSCOPE_API_KEY"),
-                "翻唱服务 Key：" + filled("singing", "SINGING_API_KEY"),
+                "API Key：" + filled,
             ]
         )
 

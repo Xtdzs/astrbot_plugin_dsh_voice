@@ -10,7 +10,6 @@ files = [
     "main.py",
     "core.py",
     "providers.py",
-    "singing.py",
     "errors.py",
     "metadata.yaml",
     "_conf_schema.json",
@@ -32,35 +31,3 @@ with ZipFile(target) as archive:
     assert archive.testzip() is None
     assert len(archive.namelist()) == len(files)
 print(f"Created {target} ({target.stat().st_size:,} bytes)")
-
-# GPU deployment is a separate archive: AstrBot never installs its requirements.
-cloud_target = root / "dist" / f"seedvc-cloud-v{version}.zip"
-with ZipFile(cloud_target, "w", ZIP_DEFLATED) as archive:
-    for name in ("Dockerfile", "app.py", "requirements.txt", "README.md"):
-        archive.write(root / "cloud_seedvc" / name, name)
-    archive.write(root / "LICENSE", "LICENSE")
-with ZipFile(cloud_target) as archive:
-    assert archive.testzip() is None
-print(f"Created {cloud_target} ({cloud_target.stat().st_size:,} bytes)")
-
-local_target = root / "dist" / f"seedvc-local-v{version}.zip"
-with ZipFile(local_target, "w", ZIP_DEFLATED) as archive:
-    for name in (
-        "setup.py",
-        "download.py",
-        "diagnose.py",
-        "engine.py",
-        "server.py",
-        "separate.py",
-        "worker.py",
-        "watchdog.py",
-        "install_autostart.ps1",
-        "requirements.txt",
-        "README.md",
-    ):
-        archive.write(root / "local_seedvc" / name, "local_seedvc/" + name)
-    archive.write(root / "cloud_seedvc/app.py", "cloud_seedvc/app.py")
-    archive.write(root / "LICENSE", "LICENSE")
-with ZipFile(local_target) as archive:
-    assert archive.testzip() is None
-print(f"Created {local_target} ({local_target.stat().st_size:,} bytes)")
