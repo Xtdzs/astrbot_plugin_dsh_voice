@@ -1,20 +1,6 @@
 {
-  "reply_mode": {
-    "description": "回复方式：语音或文字",
-    "type": "string",
-    "default": "voice",
-    "options": [
-      "voice",
-      "text"
-    ],
-    "labels": [
-      "只发语音",
-      "只发文字"
-    ],
-    "hint": "语音成功时不发送同内容文字；转换失败或内容无法朗读时保留原文字。QQ 中可用 /voice 语音 或 /voice 文字 覆盖自己的模式。"
-  },
   "speech": {
-    "description": "说话设置",
+    "description": "说话 API 与音色（发送形式由模型自主选择）",
     "type": "object",
     "items": {
       "provider": {
@@ -44,10 +30,10 @@
         "hint": "较长回复按自然停顿分成多段语音，不发送重复文字。千问每段最多 600 字。"
       },
       "max_reply_characters": {
-        "description": "单条回复的自动朗读总字数上限",
+        "description": "单次语音内容总字数上限",
         "type": "int",
         "default": 2000,
-        "hint": "超过上限时保留完整文字，避免自动生成过多付费语音。不会截断原回复。"
+        "hint": "超出时工具返回失败，由现有模型用文字回答；不截断内容。"
       }
     }
   },

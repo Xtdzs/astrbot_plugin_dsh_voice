@@ -8,7 +8,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from test_plugin import PACKAGE, PluginError, config, core, providers, wav_bytes
 
@@ -129,8 +129,6 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.config = config()
         self.plugin.root = Path(self.folder.name)
         self.plugin.media_dir = self.plugin.root
-        self.plugin.mode_path = self.plugin.root / "reply-modes.json"
-        self.plugin.modes = {}
         self.plugin.gate = core.RequestGate(cooldown=0)
         self.plugin.tasks = set()
         self.plugin.closing = False
@@ -157,32 +155,87 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         await self.plugin.prepare_stream(event, None)
         await event.send_streaming(source(), True)
 
-    async def test_voice_mode_replaces_answer_text_without_calling_chat_model(self):
-        event = Event()
-        await self.plugin.decorate_reply(event)
-        self.assertEqual(event.result.chain, [self.record])
-        self.assertFalse(event.stopped)
-        self.assertEqual(event.messages, [])
-        self.plugin.make_records.assert_awaited_once_with(event, "今天过得怎么样？")
-        self.assertFalse(hasattr(self.plugin, "dsh"))
-
-    async def test_text_mode_preserves_reply_without_tts(self):
-        self.plugin.config["reply_mode"] = "text"
+    async def test_plain_model_answer_stays_text_without_forced_tts(self):
         event = Event()
         original = event.result.chain
         await self.plugin.decorate_reply(event)
         self.assertIs(event.result.chain, original)
         self.plugin.make_records.assert_not_awaited()
+        self.assertFalse(event.stopped)
+        self.assertEqual(event.messages, [])
+        self.assertFalse(hasattr(self.plugin, "dsh"))
 
-    async def test_voice_failure_keeps_only_original_text(self):
-        self.plugin.make_records.side_effect = PluginError("余额不足")
+    async def test_policy_preserves_persona_and_requests_model_choice(self):
+        event = Event()
+        req = types.SimpleNamespace(system_prompt="原来的角色设定")
+        await self.plugin.prepare_stream(event, req)
+        self.assertTrue(req.system_prompt.startswith("原来的角色设定"))
+        self.assertIn("自主选择", req.system_prompt)
+        self.assertIn("voice_speak", req.system_prompt)
+        self.assertIn("选择文字时直接正常回复", req.system_prompt)
+        self.plugin.make_records.assert_not_awaited()
+        self.assertFalse(event.stopped)
+        self.plugin.restore_stream(event)
+
+    async def test_policy_and_stream_wrapper_are_not_added_twice(self):
+        event = Event()
+        req = types.SimpleNamespace(system_prompt="原人格")
+        await self.plugin.prepare_stream(event, req)
+        wrapped = event.send_streaming
+        await self.plugin.prepare_stream(event, req)
+        self.assertIs(event.send_streaming, wrapped)
+        self.assertEqual(req.system_prompt.count(main.MEDIA_POLICY), 1)
+        self.plugin.restore_stream(event)
+
+    async def test_model_can_choose_voice_without_explicit_voice_request(self):
+        event = Event("今天有点累")
+        result = await self.plugin.speak_tool(event, "辛苦啦，先休息一会儿吧。")
+        await self.plugin.decorate_reply(event)
+        self.assertIn("语音已发送", result)
+        self.assertEqual(event.messages, [[self.record]])
+        self.assertEqual(event.result.chain, [])
+        self.plugin.make_records.assert_awaited_once()
+
+    async def test_next_turn_can_choose_text_after_previous_voice(self):
+        first = Event()
+        await self.plugin.speak_tool(first, "你好呀")
+        second = Event()
+        original = second.result.chain
+        await self.plugin.decorate_reply(second)
+        self.assertIs(second.result.chain, original)
+        self.assertFalse(second.get_extra(main.PREFIX + "tool_audio", False))
+        self.plugin.make_records.assert_awaited_once()
+
+    async def test_old_fixed_mode_configuration_and_file_are_ignored(self):
+        self.plugin.config["reply_mode"] = "voice"
+        (self.plugin.root / "reply-modes.json").write_text(
+            json.dumps({"old-user": "voice"}), encoding="utf-8"
+        )
+        with (
+            patch.object(main.StarTools, "get_data_dir", return_value=self.plugin.root),
+            patch.object(main, "CloudAudio", return_value=self.plugin.cloud),
+        ):
+            fresh = main.VoiceAddonPlugin(object(), self.plugin.config)
         event = Event()
         original = event.result.chain
+        await fresh.decorate_reply(event)
+        self.assertFalse(hasattr(fresh, "modes"))
+        self.assertFalse(hasattr(fresh, "mode_path"))
+        self.assertIs(event.result.chain, original)
+        self.plugin.cloud.speech.assert_not_awaited()
+
+    async def test_voice_failure_keeps_model_text_and_never_claims_success(self):
+        self.plugin.make_records.side_effect = PluginError("余额不足")
+        event = Event()
+        result = await self.plugin.speak_tool(event, "你好")
+        original = event.result.chain
         await self.plugin.decorate_reply(event)
+        self.assertIn("本次音频未发送", result)
+        self.assertNotIn("语音已发送", result)
         self.assertIs(event.result.chain, original)
         self.assertEqual(event.messages, [])
 
-    async def test_text_not_removed_before_audio_is_ready(self):
+    async def test_text_not_suppressed_until_audio_delivery_succeeds(self):
         pending = asyncio.get_running_loop().create_future()
 
         async def delayed(*args):
@@ -190,40 +243,42 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
 
         self.plugin.make_records.side_effect = delayed
         event = Event()
-        task = asyncio.create_task(self.plugin.decorate_reply(event))
+        task = asyncio.create_task(self.plugin.speak_tool(event, "你好"))
         await asyncio.sleep(0)
-        self.assertIsInstance(event.result.chain[0], main.Comp.Plain)
+        original = event.result.chain
+        await self.plugin.decorate_reply(event)
+        self.assertIs(event.result.chain, original)
         pending.set_result([self.record])
         await task
-        self.assertEqual(event.result.chain, [self.record])
+        await self.plugin.decorate_reply(event)
+        self.assertEqual(event.result.chain, [])
 
-    async def test_already_spoken_reply_is_not_synthesized_twice(self):
+    async def test_successful_voice_tool_suppresses_text_but_preserves_image(self):
+        image = main.Comp.Image(file="picture.png")
+        event = Event(result=Result([main.Comp.Plain("看这张图"), image]))
+        await self.plugin.speak_tool(event, "看这张图")
+        await self.plugin.decorate_reply(event)
+        self.assertEqual(event.result.chain, [image])
+        self.assertEqual(event.messages, [[self.record]])
+
+    async def test_existing_record_is_not_accompanied_by_transcript(self):
         event = Event(result=Result([main.Comp.Plain("你好"), self.record]))
         await self.plugin.decorate_reply(event)
         self.assertEqual(event.result.chain, [self.record])
         self.plugin.make_records.assert_not_awaited()
 
-    async def test_plugin_messages_and_unallowed_users_are_not_modified(self):
+    async def test_plugin_messages_and_unallowed_users_are_not_changed(self):
         event = Event(result=Result([main.Comp.Plain("插件帮助")], llm=False))
+        event.set_extra(main.PREFIX + "tool_audio", True)
+        original = event.result.chain
         await self.plugin.decorate_reply(event)
+        self.assertIs(event.result.chain, original)
         self.plugin.config["limits"]["allowed_users"] = ["99999"]
-        await self.plugin.decorate_reply(Event())
+        reply = await self.plugin.speak_tool(Event(), "你好")
+        self.assertIn("不在此插件", reply)
         self.plugin.make_records.assert_not_awaited()
 
-    async def test_empty_tool_round_does_not_consume_final_reply(self):
-        event = Event(result=Result([]))
-        await self.plugin.decorate_reply(event)
-        event.result = Result([main.Comp.Plain("最终答案")])
-        await self.plugin.decorate_reply(event)
-        self.plugin.make_records.assert_awaited_once_with(event, "最终答案")
-
-    async def test_nontext_media_is_preserved(self):
-        image = main.Comp.Image(file="picture.png")
-        event = Event(result=Result([main.Comp.Plain("看这张图"), image]))
-        await self.plugin.decorate_reply(event)
-        self.assertEqual(event.result.chain, [image, self.record])
-
-    async def test_stream_sends_voice_without_answer_text_or_reasoning(self):
+    async def test_stream_without_audio_choice_sends_only_model_text(self):
         event = Event()
         original = event.send_streaming
         await self.stream(
@@ -234,61 +289,60 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
                 main.MessageChain([main.Comp.Plain("好呀！")]),
             ],
         )
-        self.assertEqual(
-            [part for chain in event.streamed for part in chain.chain], [self.record]
-        )
-        self.plugin.make_records.assert_awaited_once_with(event, "你好呀！")
+        parts = [p for c in event.streamed for p in c.chain]
+        self.assertEqual([p.text for p in parts], ["你好呀！"])
+        self.plugin.make_records.assert_not_awaited()
         self.assertEqual(event.send_streaming, original)
 
-    async def test_text_stream_is_unchanged_and_does_not_synthesize(self):
-        self.plugin.config["reply_mode"] = "text"
+    async def test_late_stream_voice_choice_does_not_leak_earlier_text(self):
         event = Event()
-        chunks = [main.MessageChain([main.Comp.Plain("原来的回答")])]
-        await self.stream(event, chunks)
-        self.assertEqual(event.streamed, chunks)
-        self.plugin.make_records.assert_not_awaited()
 
-    async def test_stream_tts_failure_emits_original_text_once(self):
+        async def source():
+            yield main.MessageChain([main.Comp.Plain("我想安慰你")])
+            self.assertEqual(event.streamed, [])
+            await self.plugin.speak_tool(event, "辛苦啦")
+            yield main.MessageChain(type="break")
+            yield main.MessageChain([main.Comp.Plain("语音已经发给你了")])
+
+        await self.plugin.prepare_stream(event, None)
+        await event.send_streaming(source())
+        self.assertEqual(event.messages, [[self.record]])
+        self.assertEqual(event.streamed, [])
+
+    async def test_failed_stream_audio_choice_falls_back_to_final_model_text(self):
         self.plugin.make_records.side_effect = PluginError("网络错误")
         event = Event()
-        await self.stream(
-            event,
-            [
-                main.MessageChain([main.Comp.Plain("你")]),
-                main.MessageChain([main.Comp.Plain("好")]),
-            ],
+
+        async def source():
+            yield main.MessageChain([main.Comp.Plain("前言")])
+            await self.plugin.speak_tool(event, "你好")
+            yield main.MessageChain(type="break")
+            yield main.MessageChain([main.Comp.Plain("先用文字跟你说，辛苦啦。")])
+
+        await self.plugin.prepare_stream(event, None)
+        await event.send_streaming(source())
+        self.assertEqual(
+            [p.text for c in event.streamed for p in c.chain],
+            ["先用文字跟你说，辛苦啦。"],
         )
-        parts = [part for chain in event.streamed for part in chain.chain]
-        self.assertEqual([part.text for part in parts], ["你好"])
+        self.assertEqual(event.messages, [])
 
-    async def test_stream_does_not_emit_partial_text_while_tts_is_pending(self):
-        pending = asyncio.get_running_loop().create_future()
-
-        async def delayed(*args):
-            return await pending
-
-        self.plugin.make_records.side_effect = delayed
+    async def test_text_stream_waits_for_final_delivery_choice(self):
+        released = asyncio.Event()
         event = Event()
-        task = asyncio.create_task(
-            self.stream(event, [main.MessageChain([main.Comp.Plain("你好")])])
-        )
+
+        async def source():
+            yield main.MessageChain([main.Comp.Plain("你好")])
+            await released.wait()
+
+        await self.plugin.prepare_stream(event, None)
+        task = asyncio.create_task(event.send_streaming(source()))
         await asyncio.sleep(0)
         self.assertEqual(event.streamed, [])
-        pending.set_result([self.record])
+        released.set()
         await task
-        self.assertEqual(event.streamed[0].chain, [self.record])
-
-    async def test_stream_tool_preamble_is_not_spoken(self):
-        event = Event()
-        await self.stream(
-            event,
-            [
-                main.MessageChain([main.Comp.Plain("我查一下")]),
-                main.MessageChain(type="break"),
-                main.MessageChain([main.Comp.Plain("查到了")]),
-            ],
-        )
-        self.plugin.make_records.assert_awaited_once_with(event, "查到了")
+        self.assertEqual(event.streamed[0].chain[0].text, "你好")
+        self.plugin.make_records.assert_not_awaited()
 
     async def test_native_stream_voice_is_not_duplicated(self):
         event = Event()
@@ -299,12 +353,23 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
                 main.MessageChain([main.Comp.Plain("转录文字")]),
             ],
         )
+        self.assertEqual([p for c in event.streamed for p in c.chain], [self.record])
         self.plugin.make_records.assert_not_awaited()
-        self.assertEqual(
-            [part for chain in event.streamed for part in chain.chain], [self.record]
-        )
 
-    async def test_broken_stream_restores_original_sender(self):
+    async def test_native_voice_remains_authoritative_after_tool_round_break(self):
+        event = Event()
+        await self.stream(
+            event,
+            [
+                main.MessageChain([self.record]),
+                main.MessageChain(type="break"),
+                main.MessageChain([main.Comp.Plain("声音发送后的文字确认")]),
+            ],
+        )
+        self.assertEqual([p for c in event.streamed for p in c.chain], [self.record])
+        self.plugin.make_records.assert_not_awaited()
+
+    async def test_broken_stream_restores_sender_without_inventing_a_reply(self):
         event = Event()
         original = event.send_streaming
 
@@ -316,70 +381,91 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             await event.send_streaming(broken())
         self.assertEqual(event.send_streaming, original)
+        self.assertEqual(event.streamed, [])
         self.plugin.make_records.assert_not_awaited()
 
-    async def test_prepare_stream_does_not_wrap_twice(self):
+    async def test_repeated_tool_call_is_idempotent_after_success(self):
         event = Event()
-        await self.plugin.prepare_stream(event, None)
-        wrapped = event.send_streaming
-        await self.plugin.prepare_stream(event, None)
-        self.assertIs(event.send_streaming, wrapped)
-        self.plugin.restore_stream(event)
+        one = await self.plugin.speak_tool(event, "你好")
+        two = await self.plugin.speak_tool(event, "你好")
+        self.assertEqual(one, two)
+        self.assertEqual(event.messages, [[self.record]])
+        self.plugin.make_records.assert_awaited_once()
 
-    async def test_mode_command_persists_and_is_per_user(self):
-        event = Event("voice 文字")
-        await self.plugin.voice_command(event)
-        self.assertEqual(self.plugin.mode(event), "text")
-        self.assertEqual(self.plugin.mode(Event(sender="10002")), "voice")
-        saved = json.loads(self.plugin.mode_path.read_text("utf-8"))
-        self.assertEqual(saved[self.plugin.key(event)], "text")
-        event.message_str = "voice 默认"
-        await self.plugin.voice_command(event)
-        self.assertEqual(self.plugin.mode(event), "voice")
+    async def test_repeated_failed_tool_call_does_not_retry_paid_request(self):
+        self.plugin.make_records.side_effect = PluginError("余额不足")
+        event = Event()
+        one = await self.plugin.speak_tool(event, "你好")
+        two = await self.plugin.speak_tool(event, "你好")
+        self.assertEqual(one, two)
+        self.plugin.make_records.assert_awaited_once()
 
-    async def test_manual_speech_sends_no_text_copy(self):
+    async def test_parallel_duplicate_tool_calls_do_not_send_twice(self):
+        released = asyncio.Event()
+
+        async def delayed(*args):
+            await released.wait()
+            return [self.record]
+
+        self.plugin.make_records.side_effect = delayed
+        event = Event()
+        task = asyncio.create_task(self.plugin.speak_tool(event, "你好"))
+        await asyncio.sleep(0)
+        duplicate = await self.plugin.speak_tool(event, "你好")
+        self.assertIn("正在发送", duplicate)
+        released.set()
+        await task
+        self.assertEqual(event.messages, [[self.record]])
+        self.plugin.make_records.assert_awaited_once()
+
+    async def test_partial_audio_delivery_does_not_duplicate_text_or_restart(self):
+        second = main.Comp.Record(file="second.wav", url="second.wav")
+        self.plugin.make_records.return_value = [self.record, second]
+        event = Event()
+        original_send = event.send
+
+        async def send(message):
+            if message == [second]:
+                raise RuntimeError("platform send failed")
+            await original_send(message)
+
+        event.send = send
+        result = await self.plugin.speak_tool(event, "两段内容")
+        self.assertIn("已有音频送出", result)
+        await self.plugin.decorate_reply(event)
+        self.assertEqual(event.messages, [[self.record]])
+        self.assertEqual(event.result.chain, [])
+        await self.plugin.speak_tool(event, "两段内容")
+        self.plugin.make_records.assert_awaited_once()
+
+    async def test_manual_speech_is_still_available_for_testing(self):
         event = Event("说话 今天天气真好")
         await self.plugin.say_command(event)
         self.assertEqual(event.messages, [[self.record]])
         self.assertTrue(event.stopped)
 
-    async def test_switching_to_voice_confirms_in_voice_only(self):
+    async def test_old_mode_command_does_not_force_a_persistent_mode(self):
         event = Event("voice 语音")
         await self.plugin.voice_command(event)
-        self.assertEqual(event.messages, [[self.record]])
+        self.assertIn("模型自行选择", event.messages[0])
+        self.plugin.make_records.assert_not_awaited()
+        self.assertFalse((self.plugin.root / "reply-modes.json").exists())
 
-    async def test_explicit_speech_tool_does_not_add_text_confirmation_in_text_mode(
-        self,
-    ):
-        self.plugin.config["reply_mode"] = "text"
-        event = Event()
-        await self.plugin.speak_tool(event, "你好")
-        await self.plugin.decorate_reply(event)
-        self.assertEqual(event.messages, [[self.record]])
-        self.assertEqual(event.result.chain, [])
-
-    async def test_streamed_tool_confirmation_is_suppressed_in_text_mode(self):
-        self.plugin.config["reply_mode"] = "text"
-        event = Event()
-
-        async def source():
-            await self.plugin.speak_tool(event, "你好")
-            yield main.MessageChain([main.Comp.Plain("已说出你好")])
-
-        await self.plugin.prepare_stream(event, None)
-        await event.send_streaming(source())
-        self.assertEqual(event.messages, [[self.record]])
-        self.assertEqual(event.streamed, [])
-
-    async def test_lyrics_newlines_preserved(self):
-        event = Event("voice 写歌 民谣 | [Verse]\n第一句\n第二句")
-        await self.plugin.voice_command(event)
-        self.plugin.cloud.music.assert_awaited_once_with(
-            "民谣", "[Verse]\n第一句\n第二句"
+    async def test_model_can_choose_song_and_suppress_confirmation(self):
+        event = Event("今天好开心")
+        reply = await self.plugin.compose_tool(
+            event, "一首庆祝今天的轻快中文短歌", "[Verse]\n今天天气真好"
         )
-        self.assertEqual(event.messages, [])
+        self.assertIn("歌曲已发送", reply)
+        self.plugin.cloud.music.assert_awaited_once_with(
+            "一首庆祝今天的轻快中文短歌", "[Verse]\n今天天气真好"
+        )
+        self.plugin.send_audio.assert_awaited_once()
+        await self.plugin.decorate_reply(event)
+        self.assertEqual(event.result.chain, [])
+        self.plugin.make_records.assert_not_awaited()
 
-    async def test_cover_uses_rvc_without_a_chat_or_tts_request(self):
+    async def test_cover_uses_rvc_without_new_chat_or_tts_request(self):
         event = Event("唱歌 https://audio.example.org/song.mp3")
         await self.plugin.sing_command(event)
         self.plugin.cloud.convert.assert_awaited_once()
@@ -387,56 +473,40 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.send_audio.assert_awaited_once()
         self.assertEqual(event.messages, [])
 
-    async def test_existing_model_can_call_song_tool(self):
-        event = Event()
-        reply = await self.plugin.cover_tool(
-            event, "https://audio.example.org/song.mp3"
-        )
-        self.assertIn("歌曲已发送", reply)
-        self.plugin.cloud.convert.assert_awaited_once()
-        await self.plugin.decorate_reply(event)
-        self.plugin.make_records.assert_not_awaited()
-        self.assertEqual(event.result.chain, [])
-
-    async def test_failed_tool_does_not_report_success(self):
-        self.plugin.cloud.convert.side_effect = PluginError("音色未配置")
-        reply = await self.plugin.cover_tool(
-            Event(), "https://audio.example.org/song.mp3"
-        )
-        self.assertEqual(reply, "音色未配置")
-
-    async def test_real_record_builder_uses_cloud_tts_and_wav_only(self):
+    async def test_real_record_builder_runs_only_when_model_selects_voice(self):
         del self.plugin.make_records
         event = Event()
         await self.plugin.decorate_reply(event)
-        self.assertTrue(
-            all(isinstance(part, main.Comp.Record) for part in event.result.chain)
-        )
-        self.assertTrue(Path(event.result.chain[0].file).exists())
+        self.plugin.cloud.speech.assert_not_awaited()
+        await self.plugin.speak_tool(event, "你好")
+        await self.plugin.decorate_reply(event)
+        self.assertEqual(event.result.chain, [])
+        self.assertTrue(Path(event.messages[0][0].file).exists())
         self.assertFalse(self.plugin.gate.active)
 
-    async def test_second_chunk_failure_does_not_send_first_voice_or_remove_text(self):
+    async def test_second_chunk_generation_failure_preserves_original_text(self):
         del self.plugin.make_records
         self.plugin.config["speech"]["max_characters"] = 30
         self.plugin.cloud.speech.side_effect = [
             providers.Audio(content=wav_bytes()),
             PluginError("second failed"),
         ]
-        event = Event(
-            result=Result([main.Comp.Plain("这是一段比较长的中文回复。" * 8)])
-        )
+        event = Event()
+        reply = await self.plugin.speak_tool(event, "这是一段比较长的中文回复。" * 8)
         original = event.result.chain
         await self.plugin.decorate_reply(event)
+        self.assertIn("本次音频未发送", reply)
         self.assertIs(event.result.chain, original)
         self.assertEqual(event.messages, [])
         self.assertFalse(self.plugin.gate.active)
 
-    async def test_status_never_exposes_keys_or_requires_chat_credentials(self):
+    async def test_status_shows_autonomous_choice_and_never_exposes_keys(self):
         event = Event("voice 状态")
         await self.plugin.voice_command(event)
         self.assertNotIn("fake-", event.messages[0])
         self.assertNotIn("DSH", event.messages[0])
-        self.assertIn("只发语音", event.messages[0])
+        self.assertIn("自主选择", event.messages[0])
+        self.assertNotIn("只发语音", event.messages[0])
 
 
 if __name__ == "__main__":

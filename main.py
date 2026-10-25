@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import json
 import os
 import re
 import shutil
@@ -19,17 +18,25 @@ from .core import RequestGate, conversation_key, spoken_chunks
 from .errors import PluginError
 from .providers import Audio, CloudAudio, public_url
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 PREFIX = "voice_addon_"
+MEDIA_POLICY = """
+[语音与唱歌外挂]
+每条回复的表达形式由你根据当前对话、用户意愿和原有角色性格自主选择，不需要用户切换模式。
+选择文字时直接正常回复，不调用音频工具。聊天适合开口、表达情绪、问候或口头解释时，你可以自主调用 voice_speak，把真正要说的正文放进 text；不要只是宣称自己正在说话。
+选择唱歌时，有真实演唱音频直链可调用 voice_sing_cover；要创作一首新歌可调用 voice_compose_song。不要编造音频链接。
+用户对本次发送形式有明确要求时优先遵从。仅在本轮实际提供对应工具时调用；没有可用工具就自然回复文字，不输出伪造的调用代码。
+音频工具发送成功后，本轮不要再发送文字正文、相同内容的转录或成功确认，直接结束即可。工具返回只是给你的执行结果，不要照读给用户。
+若音频发送失败且没有声音送出，就用文字自然回答；不要假装已经成功，也不要向用户展示 API 字段或技术过程。
+这段规则只补充发送方式，不改变你原有的人格、记忆和聊天能力。
+""".strip()
 HELP = """语音与角色翻唱
-/voice 语音 —— 本会话中你的回复只发语音
-/voice 文字 —— 本会话中你的回复只发文字
-/voice 默认 —— 恢复管理面板的回复模式
-/voice 说 今天也要开心 —— 直接说出指定内容
-/voice 唱 https://…/song.mp3 —— 角色音色翻唱
-/voice 写歌 轻快中文流行 | 歌词 —— 生成歌曲
-/voice 状态 —— 查看模式和语音配置
-也支持 /说话、/唱歌、/写歌。翻唱需要音频直链和 RVC 模型。"""
+每条回复由你现有的模型自行决定发文字、语音还是唱歌，无需切换模式。
+/说话 今天也要开心 —— 手动测试语音
+/唱歌 https://…/song.mp3 —— 翻唱指定音频
+/写歌 轻快中文流行 | 歌词 —— 手动生成歌曲
+/voice 状态 —— 查看音频配置
+配置面板用于填写语音/音乐 API 与音色。模型需启用工具调用，才能自主选择声音。"""
 
 
 class VoiceAddonPlugin(Star):
@@ -50,26 +57,9 @@ class VoiceAddonPlugin(Star):
         )
         self.tasks: set[asyncio.Task] = set()
         self.closing = False
-        self.mode_path = self.root / "reply-modes.json"
-        try:
-            loaded = json.loads(self.mode_path.read_text("utf-8"))
-            self.modes = (
-                {str(k): v for k, v in loaded.items() if v in ("text", "voice")}
-                if isinstance(loaded, dict)
-                else {}
-            )
-        except FileNotFoundError:
-            self.modes = {}
-        except (ValueError, OSError):
-            self.modes = {}
-            logger.warning("[voice_addon] 回复模式文件无法读取，使用管理面板的模式。")
 
     def key(self, event):
         return conversation_key(event.unified_msg_origin, str(event.get_sender_id()))
-
-    def mode(self, event):
-        value = self.modes.get(self.key(event), self.config.get("reply_mode", "voice"))
-        return "voice" if value == "voice" else "text"
 
     def allowed(self, sender: str) -> bool:
         users = self.config.get("limits", {}).get("allowed_users", [])
@@ -84,48 +74,33 @@ class VoiceAddonPlugin(Star):
 
     @filter.on_decorating_result(priority=-100)
     async def decorate_reply(self, event: AstrMessageEvent):
-        """Replace only a completed model reply's text after all audio is ready."""
+        """Keep model-written text unless this turn has actually sent audio."""
         if not self.event_enabled(event):
             return
         result = event.get_result()
-        if result is None or not result.is_llm_result() or not result.chain:
-            return
-        if event.get_extra(PREFIX + "tool_audio", False):
-            result.chain = [
-                part for part in result.chain if not isinstance(part, Comp.Plain)
-            ]
-            return
-        if self.mode(event) == "text":
-            self.restore_stream(event)
-            return
-        if any(isinstance(part, Comp.Record) for part in result.chain):
-            result.chain = [
-                part for part in result.chain if not isinstance(part, Comp.Plain)
-            ]
-            return
-        text = "\n".join(
-            part.text for part in result.chain if isinstance(part, Comp.Plain)
-        ).strip()
-        if not text:
+        if result is None or not result.is_llm_result():
             return
         self.restore_stream(event)
-        try:
-            records = await self.make_records(event, text)
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            # Leave the original result intact when TTS fails. No extra technical message.
-            self.log_voice_failure(error)
-            return
-        if records:
+        if event.get_extra(PREFIX + "tool_audio", False) or any(
+            isinstance(part, Comp.Record) for part in (result.chain or [])
+        ):
             result.chain = [
-                part for part in result.chain if not isinstance(part, Comp.Plain)
-            ] + records
+                part
+                for part in (result.chain or [])
+                if not isinstance(part, Comp.Plain)
+            ]
 
     @filter.on_llm_request()
     async def prepare_stream(self, event: AstrMessageEvent, req):
-        """Translate a streaming reply to audio before any answer text is delivered."""
-        if not self.event_enabled(event) or event.get_extra(PREFIX + "stream"):
+        """Offer audio tools and wait for the model to choose this turn's medium."""
+        if not self.event_enabled(event):
+            return
+        # A stable addition preserves the existing persona and avoids a second model call.
+        if req is not None and hasattr(req, "system_prompt"):
+            current = req.system_prompt or ""
+            if MEDIA_POLICY not in current:
+                req.system_prompt = current + "\n\n" + MEDIA_POLICY
+        if event.get_extra(PREFIX + "stream"):
             return
         original = event.send_streaming
 
@@ -134,16 +109,10 @@ class VoiceAddonPlugin(Star):
                 texts = []
                 has_audio = False
                 async for chain in generator:
-                    if self.mode(event) == "text" and not event.get_extra(
-                        PREFIX + "tool_audio", False
-                    ):
-                        yield chain
-                        continue
                     kind = getattr(chain, "type", None)
                     if kind == "break":
-                        # A tool round ended: speak the final answer, not its preamble.
+                        # Only the final text is eligible; audio already sent stays sent.
                         texts.clear()
-                        has_audio = False
                         continue
                     if kind in ("reasoning", "tool_call", "agent_stats"):
                         continue
@@ -167,24 +136,13 @@ class VoiceAddonPlugin(Star):
                         yield forwarded
                 text = "".join(texts).strip()
                 if (
-                    not text
-                    or self.mode(event) == "text"
-                    or has_audio
-                    or event.get_extra(PREFIX + "tool_audio", False)
+                    text
+                    and not has_audio
+                    and not event.get_extra(PREFIX + "tool_audio", False)
                 ):
-                    return
-                if self.closing:
+                    # No audio tool was selected (or it failed): deliver the model's text.
+                    # Buffering prevents a late voice tool from duplicating earlier text.
                     yield MessageChain([Comp.Plain(text)])
-                    return
-                try:
-                    records = await self.make_records(event, text)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as error:
-                    self.log_voice_failure(error)
-                    records = []
-                # Do not emit text until conversion is known to have failed or been skipped.
-                yield MessageChain(records if records else [Comp.Plain(text)])
 
             try:
                 return await original(audio_stream(), *args, **kwargs)
@@ -204,7 +162,7 @@ class VoiceAddonPlugin(Star):
 
     def log_voice_failure(self, error):
         detail = str(error) if isinstance(error, PluginError) else type(error).__name__
-        logger.warning(f"[voice_addon] 语音未生成，保留文字：{detail}")
+        logger.warning(f"[voice_addon] 音频调用未完成：{detail}")
 
     async def make_records(self, event, text):
         speech = self.config.get("speech", {})
@@ -241,7 +199,7 @@ class VoiceAddonPlugin(Star):
 
     @filter.command("voice", alias={"语音", "dsh"}, priority=100)
     async def voice_command(self, event: AstrMessageEvent):
-        """选择文字或语音回复，或使用朗读、翻唱、写歌功能。"""
+        """查看模型自主发送声音的配置，或手动测试朗读、翻唱与写歌。"""
         event.set_extra(PREFIX + "command", True)
         event.stop_event()
         parts = re.split(r"\s+", event.message_str.strip(), maxsplit=1)
@@ -282,29 +240,11 @@ class VoiceAddonPlugin(Star):
             elif verb in ("状态", "status"):
                 await event.send(event.plain_result(self.status(event)))
             elif verb in ("语音", "文字", "默认", "voice", "text", "default"):
-                key = self.key(event)
-                if verb in ("默认", "default"):
-                    self.modes.pop(key, None)
-                else:
-                    self.modes[key] = "voice" if verb in ("语音", "voice") else "text"
-                temp = self.mode_path.with_suffix(".tmp")
-                temp.write_text(json.dumps(self.modes), encoding="utf-8")
-                temp.replace(self.mode_path)
-                confirmation = (
-                    "好呀，接下来我用语音和你聊。"
-                    if self.mode(event) == "voice"
-                    else "好，接下来用文字回复你。"
+                await event.send(
+                    event.plain_result(
+                        "现在每条回复由模型自行选择文字或语音，无需固定模式。你可以正常聊天，或用 /说话 测试声音。"
+                    )
                 )
-                if self.mode(event) == "voice":
-                    try:
-                        records = await self.make_records(event, confirmation)
-                        for record in records:
-                            await event.send(event.chain_result([record]))
-                    except PluginError as error:
-                        self.log_voice_failure(error)
-                        await event.send(event.plain_result(confirmation))
-                else:
-                    await event.send(event.plain_result(confirmation))
             else:
                 await self.perform(event, verb, argument)
         except PluginError as error:
@@ -328,10 +268,11 @@ class VoiceAddonPlugin(Star):
                 raise PluginError("这段内容没有可以朗读的文字。")
             for record in records:
                 await event.send(event.chain_result([record]))
-            event.set_extra(PREFIX + "tool_audio", True)
+                # Mark each delivered segment, including partial success before failure.
+                event.set_extra(PREFIX + "tool_audio", True)
             return "语音已发送，不要重复发送相同文字。"
         if verb not in ("唱", "sing", "写歌", "music"):
-            raise PluginError("发送 /voice 帮助 查看说话、唱歌和模式切换。")
+            raise PluginError("发送 /voice 帮助 查看说话、唱歌和配置说明。")
         if not argument:
             raise PluginError("用法：/唱歌 音频直链，或 /写歌 风格描述 | 歌词")
         key = self.key(event)
@@ -359,7 +300,7 @@ class VoiceAddonPlugin(Star):
 
     @filter.llm_tool(name="voice_speak")
     async def speak_tool(self, event: AstrMessageEvent, text: str) -> str:
-        """仅当用户明确要求用语音说出某段内容时调用，普通回复由插件自动处理。
+        """由你根据当前对话自主决定是否用语音表达；闲聊、问候、表达情绪等适合时可以调用。选择文字就正常回复，不调用本工具。成功后不要再发送文字确认或重复正文。
 
         Args:
             text(string): 需要说出的自然语言内容，不要包含思考过程或技术说明。
@@ -368,10 +309,10 @@ class VoiceAddonPlugin(Star):
 
     @filter.llm_tool(name="voice_sing_cover")
     async def cover_tool(self, event: AstrMessageEvent, audio_url: str) -> str:
-        """用户明确要求翻唱且提供了演唱音频直链时调用，不能把歌名或网页地址当成音频。
+        """由你判断对话适合翻唱且有真实演唱音频直链时调用。不要把歌名或网页地址当成音频。成功后直接结束，不再重复发文字。
 
         Args:
-            audio_url(string): 用户提供的可公网下载的演唱音频直链。
+            audio_url(string): 用户提供或现有工具取得的真实演唱音频公网直链。
         """
         return await self.tool_action(event, "唱", audio_url)
 
@@ -379,7 +320,7 @@ class VoiceAddonPlugin(Star):
     async def compose_tool(
         self, event: AstrMessageEvent, prompt: str, lyrics: str = ""
     ) -> str:
-        """仅当用户明确要求创作一首新歌时调用，生成并发送歌曲。
+        """由你根据当前对话和用户意愿决定是否用一首新歌回应。生成并发送歌曲，成功后不要再发送文字正文或成功确认。
 
         Args:
             prompt(string): 用户想要的歌曲主题、曲风和演唱风格。
@@ -390,15 +331,38 @@ class VoiceAddonPlugin(Star):
         )
 
     async def tool_action(self, event, verb, argument):
+        # Provider/tool loops can repeat identical calls. Never send/pay twice per turn.
+        calls = event.get_extra(PREFIX + "tool_calls")
+        if calls is None:
+            calls = {}
+            event.set_extra(PREFIX + "tool_calls", calls)
+        signature = conversation_key(verb, argument)
+        if signature in calls:
+            return (
+                calls[signature]
+                or "同一段音频正在发送，请等待，不要重复调用或声称已经成功。"
+            )
+        calls[signature] = None
         try:
-            return await self.perform(event, verb, argument)
+            result = await self.perform(event, verb, argument)
         except PluginError as error:
-            return str(error)
+            self.log_voice_failure(error)
+            result = str(error)
+            if event.get_extra(PREFIX + "tool_audio", False):
+                result += " 已有部分音频送出，本轮不要再发文字或从头重复播放。"
+            else:
+                result += " 本次音频未发送，请自然地用文字回复，不要声称已经成功。"
         except asyncio.CancelledError:
             raise
         except Exception as error:
             logger.error(f"[voice_addon] 工具失败：{type(error).__name__}")
-            return "音频发送失败，不要向用户声称已经成功。"
+            result = (
+                "后续音频发送失败；已有音频送出，不要再发文字或从头重复。"
+                if event.get_extra(PREFIX + "tool_audio", False)
+                else "音频未发送，请自然地用文字回答，不要声称已经成功。"
+            )
+        calls[signature] = result
+        return result
 
     async def send_audio(self, event, audio: Audio, song: bool):
         name = f"dsh-{uuid.uuid4().hex}"
@@ -495,8 +459,7 @@ class VoiceAddonPlugin(Star):
         return "\n".join(
             [
                 f"语音与角色翻唱 v{VERSION}",
-                "当前回复模式："
-                + ("只发语音" if self.mode(event) == "voice" else "只发文字"),
+                "发送方式：由现有聊天模型每条自主选择",
                 "语音服务：" + str(provider),
                 "说话音色：" + str(voice),
                 "MiniMax Key：" + filled("minimax", "MINIMAX_API_KEY"),

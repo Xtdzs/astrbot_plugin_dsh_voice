@@ -281,6 +281,7 @@ class CoreTests(unittest.TestCase):
         schema = json.loads((ROOT / "_conf_schema.json").read_text("utf-8"))
         self.assertNotIn("dsh", schema)
         self.assertNotIn("auto_chat", schema)
+        self.assertNotIn("reply_mode", schema)
         self.assertNotIn("deepseek", (ROOT / "requirements.txt").read_text("utf-8"))
         self.assertFalse(hasattr(core, "DshEngine"))
 

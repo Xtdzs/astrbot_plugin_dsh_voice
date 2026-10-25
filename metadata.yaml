@@ -1,7 +1,7 @@
 name: astrbot_plugin_dsh_voice
 display_name: 语音与角色翻唱
-desc: 为现有 AstrBot 回复添加语音，支持文字或语音模式、MiniMax/千问 TTS 和云端角色翻唱。
-version: 0.2.0
+desc: 让现有 AstrBot 模型自主选择文字、语音或唱歌，支持 MiniMax/千问 TTS 与云端角色翻唱。
+version: 0.3.0
 author: Xtdzs
 repo: https://github.com/Xtdzs/astrbot_plugin_dsh_voice
 astrbot_version: '>=4.0.0'
