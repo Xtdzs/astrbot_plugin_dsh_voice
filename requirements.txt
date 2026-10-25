@@ -1,0 +1,2 @@
+httpx>=0.27,<1
+deepseek-harness-sdk==0.2.1rc2
